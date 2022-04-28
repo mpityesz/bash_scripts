@@ -4,7 +4,7 @@
 STORAGE_DIR="/mnt/storage/mailroot/"
 BACKUP_DIR="/mnt/backup/mailroot_bkp/"
 
-## BACKUP_URI="remotebackup@dexter.fixnet.hu::/mnt/backup/fixnet.hu/www/storage"
+## BACKUP_URI="REMOTEBACKUPUSER@REMOTEHOST::/mnt/backup/storage"
 
 ## Backup
 rdiff-backup \
