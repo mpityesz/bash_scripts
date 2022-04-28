@@ -4,7 +4,7 @@
 STORAGE_DIR="/mnt/storage/wwwroot/"
 BACKUP_DIR="/mnt/backup/wwwroot_bkp/"
 
-## BACKUP_URI="remotebackup@dexter.fixnet.hu::/mnt/backup/fixnet.hu/www/storage"
+## BACKUP_URI="REMOTEBACKUPUSER@REMOTEHOST::/mnt/backup/storage"
 
 ## Backup
 rdiff-backup \
