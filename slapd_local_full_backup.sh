@@ -1,3 +1,5 @@
+#!/bin/bash
+
 BASE_BACKUP_PATH="/mnt/storage/woody_data/_export/slapd"
 BACKUP_FILE="fixnet.hu.ldif"
 
