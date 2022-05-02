@@ -24,7 +24,7 @@ host           smtp.gmail.com
 port           587
 from           next.inform.sup@gmail.com
 user           next.inform.sup
-password       tfugdfwitcydxxrw
+password       ##PASSWORD##
 
 ## Add other account...
 
