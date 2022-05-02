@@ -6,6 +6,7 @@
 ## Create /etc/msmtprc -> this config file
 ## Test: echo "Message" | mail -s "Title" youremailaddress@gmail.com
 ## Check logs
+## AppArmor: /var/log/msmtp/msmtp*.log wk,
 
 ## Default settings
 defaults
