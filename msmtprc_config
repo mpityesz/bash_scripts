@@ -1,0 +1,30 @@
+## Install MSMTP
+##
+## Check /etc/aliases
+## Run newaliases
+## Run apt install msmtp msmtp-mta -> sendmail alias to msmtp
+## Create /etc/msmtprc -> this config file
+
+## Default settings
+defaults
+auth           on
+tls            on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        /var/log/msmtp/msmtp.log
+syslog         LOG_MAIL
+aliases        /etc/aliases
+
+## Gmail account
+##
+## Gmail -> Account -> Security -> Create password for application
+account        gmail
+host           smtp.gmail.com
+port           587
+from           next.inform.sup@gmail.com
+user           next.inform.sup
+password       tfugdfwitcydxxrw
+
+## Add other account...
+
+## Set default account
+account default : gmail
