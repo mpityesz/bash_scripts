@@ -4,6 +4,8 @@
 ## Run newaliases
 ## Run apt install msmtp msmtp-mta -> sendmail alias to msmtp
 ## Create /etc/msmtprc -> this config file
+## Test: echo "Message" | mail -s "Title" youremailaddress@gmail.com
+## Check logs
 
 ## Default settings
 defaults
