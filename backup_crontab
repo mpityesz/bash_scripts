@@ -1,16 +1,16 @@
-## Backup installed packages list to /root/packages_list.txt
-05 22   * * *   root    /usr/local/sbin/packages_local_backup.sh 2> /root/packages_local_backup_error.txt 1> /root/packages_local_backup_stdout.txt
+## Backup installed packages list to /mnt/backup/packages/packages_list.txt
+05 22   * * *   root    /usr/local/sbin/packages_local_backup.sh >> /root/packages_local_backup_result.txt 2>&1
 ## Mysql dump to local directory
-10 22   * * *   root    /usr/local/sbin/mysql_local_dump.sh 2> /root/mysql_local_dump_error.txt 1> /root/mysql_local_dump_stdout.txt
+10 22   * * *   root    /usr/local/sbin/mysql_local_dump.sh >> /root/mysql_local_dump_result.txt 2>&1
 ## Rsync backup to specified folder from www root directory
-15 22   * * *   root    /usr/local/sbin/www_local_rdiff_backup.sh 2> /root/www_local_rdiff_backup_error.txt 1> /root/www_local_rdiff_backup_stdout.txt
+15 22   * * *   root    /usr/local/sbin/www_local_rdiff_backup.sh >> /root/www_local_rdiff_backup_result.txt 2>&1
 ## Rsync backup to specified folder from mail root directory
-25 22   * * *   root    /usr/local/sbin/mail_local_rdiff_backup.sh 2> /root/mail_local_rdiff_backup_error.txt 1> /root/mail_local_rdiff_backup_stdout.txt
+25 22   * * *   root    /usr/local/sbin/mail_local_rdiff_backup.sh >> /root/mail_local_rdiff_backup_result.txt 2>&1
 
 
 ## Run all backups to Servergarden FTP
-05 23   * * *   root    /usr/local/sbin/duplicity_all_servergarden.sh 2> /root/duplicity_all_servergarden_error.txt 1> /root/duplicity_all_servergarden_stdout.txt
+05 23   * * *   root    /usr/local/sbin/duplicity_all_servergarden.sh >> /root/duplicity_all_servergarden_result.txt 2>&1
 
 
 ## Run all backups to Morar RSYNC
-05 01   * * *   root    /usr/local/sbin/duplicity_all_morar.sh 2> /root/duplicity_all_morar_error.txt 1> /root/duplicity_all_morar_stdout.txt
+05 01   * * *   root    /usr/local/sbin/duplicity_all_morar.sh >> /root/duplicity_all_morar_result.txt 2>&1
