@@ -5,14 +5,20 @@
 ## - set root mail -> valid email address (root: email@address.tld)
 ## - run newaliases
 ## Aliases example: https://github.com/mpityesz/bash_scripts/raw/main/etc_aliases
-## 
+##
 ## Run apt install msmtp msmtp-mta -> sendmail alias to msmtp
 ## If needed, install mailutils, bsd-mailx (if another MTA is not present)
-## Create /etc/msmtprc -> this config file
+##
+## Setup
+## - /etc/msmtprc -> this config file
+## - create /var/log/msmtp folder -> chown
+##
+## AppArmor
+## - add line: /var/log/msmtp/msmtp*.log wk,
+## - run reload: apparmor_parser -R /etc/apparmor.d/usr.bin.msmtp
+##
 ## Test: echo "Message" | mail -s "Title" youremailaddress@gmail.com
 ## Check logs
-## AppArmor: /var/log/msmtp/msmtp*.log wk,
-## apparmor_parser -R /etc/apparmor.d/usr.bin.msmtp
 
 ## Default settings
 defaults
@@ -29,9 +35,9 @@ aliases        /etc/aliases
 account        gmail
 host           smtp.gmail.com
 port           587
-from           next.inform.sup@gmail.com
-user           next.inform.sup
-password       ##PASSWORD##
+from           ###EMAIL_ADDRESS###
+user           ###USERNAME###
+password       ###PASSWORD###
 
 ## Add other account...
 
