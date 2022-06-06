@@ -19,6 +19,8 @@
 ##
 ## Test1: echo "Message" | mail -s "Title" youremailaddress@gmail.com
 ## Test2: echo "Message" | mail -s "Title" root
+## Test3: mdadm --monitor --scan --test --oneshot
+##
 ## Check logs
 
 ## Default settings
