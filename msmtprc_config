@@ -1,12 +1,18 @@
 ## Install MSMTP
 ##
 ## Check /etc/aliases
-## Run newaliases
+## - set user alias -> root (user1: root)
+## - set root mail -> valid email address (root: email@address.tld)
+## - run newaliases
+## Aliases example: https://github.com/mpityesz/bash_scripts/raw/main/etc_aliases
+## 
 ## Run apt install msmtp msmtp-mta -> sendmail alias to msmtp
+## If needed, install mailutils, bsd-mailx (if another MTA is not present)
 ## Create /etc/msmtprc -> this config file
 ## Test: echo "Message" | mail -s "Title" youremailaddress@gmail.com
 ## Check logs
 ## AppArmor: /var/log/msmtp/msmtp*.log wk,
+## apparmor_parser -R /etc/apparmor.d/usr.bin.msmtp
 
 ## Default settings
 defaults
