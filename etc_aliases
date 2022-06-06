@@ -1,0 +1,16 @@
+# /etc/aliases
+default: root@
+mailer-daemon: postmaster@
+postmaster: root@
+nobody: root@
+hostmaster: root@
+usenet: root@
+news: root@
+webmaster: root@
+www: root@
+ftp: root@
+abuse: root@
+noc: root@
+security: root@
+user1: root@
+root: email@address.tld
