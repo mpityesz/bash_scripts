@@ -35,10 +35,10 @@ restart_pure_ftpd_mysql () {
 case $RENEWED_DOMAINS in
 
     "$fqdn")
-<------>restart_nginx
-<------>restart_postfix
-<------>restart_dovecot
-<------>restart_pure_ftpd_mysql
+        restart_nginx
+        restart_postfix
+        restart_dovecot
+        restart_pure_ftpd_mysql
     ;;
 
   *)
