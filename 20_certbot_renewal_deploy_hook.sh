@@ -42,6 +42,7 @@ case $RENEWED_DOMAINS in
     ;;
 
   *)
+        restart_pure_ftpd_mysql
     ;;
 
 esac
