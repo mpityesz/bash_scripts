@@ -1,14 +1,14 @@
 #!/bin/bash
 
 ###
-# Certbot renewal deploy hook
-#
-# Passed variables:
-# RENEWED_DOMAINS contains the list of domain names in the renewed certificate
-# RENEWED_LINEAGE refers to the live folder where the certificate material is stored.
+## Certbot renewal deploy hook
+##
+## Passed variables:
+## RENEWED_DOMAINS contains the list of domain names in the renewed certificate
+## RENEWED_LINEAGE refers to the live folder where the certificate material is stored.
 ###
 
-fqdn=$(hostname -f)
+FQDN=$(hostname -f)
 
 restart_nginx () {
     systemctl restart nginx.service
@@ -27,14 +27,14 @@ restart_dovecot () {
 
 restart_pure_ftpd_mysql () {
     cp /etc/ssl/private/pure-ftpd.pem /etc/ssl/private/pure-ftpd.pem.bak
-    cat /etc/letsencrypt/live/$fqdn/privkey.pem /etc/letsencrypt/live/$fqdn/fullchain.pem > /etc/ssl/private/pure-ftpd.pem
+    cat "/etc/letsencrypt/live/$FQDN/privkey.pem" "/etc/letsencrypt/live/$FQDN/fullchain.pem" > "/etc/ssl/private/pure-ftpd.pem"
     systemctl restart pure-ftpd-mysql.service
     return 0
 }
 
 case $RENEWED_DOMAINS in
 
-    "$fqdn")
+    "$FQDN")
         restart_nginx
         restart_postfix
         restart_dovecot
