@@ -17,8 +17,8 @@
 ## - add line: /var/log/msmtp/msmtp*.log wk,
 ## - run reload: apparmor_parser -R /etc/apparmor.d/usr.bin.msmtp
 ##
-## Test1: echo "Message" | mail -s "Title" youremailaddress@gmail.com
-## Test2: echo "Message" | mail -s "Title" root
+## Test1: echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" youremailaddress@gmail.com
+## Test2: echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" root
 ## Test3: mdadm --monitor --scan --test --oneshot
 ##
 ## Check logs
