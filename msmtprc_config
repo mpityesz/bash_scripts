@@ -1,3 +1,4 @@
+###
 ## Install MSMTP
 ##
 ## Check /etc/aliases
@@ -14,14 +15,16 @@
 ## - create /var/log/msmtp folder -> chown
 ##
 ## AppArmor
-## - add line: /var/log/msmtp/msmtp*.log wk,
+## - add line: /var/log/msmtp/*.log wk,
 ## - run reload: apparmor_parser -R /etc/apparmor.d/usr.bin.msmtp
 ##
 ## Test1: echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" youremailaddress@gmail.com
 ## Test2: echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" root
 ## Test3: mdadm --monitor --scan --test --oneshot
 ##
+## Logrotate
 ## Check logs
+###
 
 ## Default settings
 defaults
