@@ -106,7 +106,6 @@ alias diff='diff -u'
 
 # force colorful grep output
 alias grep='grep --color=auto'
-alias grep='grep --color=auto'
 alias fgrep='fgrep --color=auto'
 alias egrep='egrep --color=auto'
 
@@ -119,7 +118,8 @@ alias dir='dir --color=auto'
 alias vdir='vdir --color=auto'
 
 # root prompt
-if [ $(id -u) = 0 ]; then
+#if [ $(id -u) = 0 ]; then
+if [ "$EUID" -eq 0 ]; then
     echo "Root prompt setted..."
     export PS1="> \[\e[1;32m\]\t\[\e[0m\] [ \[\e[1;34m\]\u\[\e[0m\]@\[\e[1;31m\]\H\[\e[0m\] ] > \[\e[1;32m\]\W\[\e[0m\]\$: "
 fi
