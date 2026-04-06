@@ -1,51 +1,233 @@
 ###
-## Install MSMTP
+## MSMTP + mailx setup Debian 12 / Debian 13
 ##
-## Check /etc/aliases
-## - set user alias -> root (user1: root)
-## - set root mail -> valid email address (root: email@address.tld)
-## - run newaliases
-## Aliases example: https://github.com/mpityesz/bash_scripts/raw/main/etc_aliases
+## Goal:
+## - local scripts can send notification emails
+## - no full MTA (Postfix/Exim) needed
+## - external SMTP relay is used (for example Gmail)
 ##
-## Run apt install msmtp msmtp-mta -> sendmail alias to msmtp
-## If needed, install mailutils, bsd-mailx (if another MTA is not present)
+## Used packages:
+## - msmtp
+## - msmtp-mta
+## - bsd-mailx
 ##
-## Setup
-## - /etc/msmtprc -> this config file
-## - create /var/log/msmtp folder -> chown
-##
-## AppArmor
-## - add line: /var/log/msmtp/*.log wk,
-## - run reload: apparmor_parser -R /etc/apparmor.d/usr.bin.msmtp
-##
-## Test1: echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" youremailaddress@gmail.com
-## Test2: echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" root
-## Test3: mdadm --monitor --scan --test --oneshot
-##
-## Logrotate
-## Check logs
+## Why this setup:
+## - bsd-mailx provides the `mail` command
+## - msmtp-mta provides sendmail compatibility
+## - msmtp sends mail through an external SMTP server
 ###
 
+
+###
+## 1. Install packages
+###
+apt install msmtp msmtp-mta bsd-mailx
+
+
+###
+## 2. Configure aliases
+##
+## File:
+## - /etc/aliases
+##
+## Notes:
+## - msmtp reads this file directly
+## - `newaliases` is not needed in this setup
+## - local system recipients should resolve to root
+## - root should resolve to a real external email address
+###
+cat > /etc/aliases <<'EOF'
+default: email@address.tld
+mailer-daemon: root
+postmaster: root
+nobody: root
+hostmaster: root
+usenet: root
+news: root
+webmaster: root
+www: root
+ftp: root
+abuse: root
+noc: root
+security: root
+user1: root
+root: email@address.tld
+EOF
+
+
+###
+## 3. Configure MSMTP
+##
+## File:
+## - /etc/msmtprc
+##
+## Permissions:
+## - recommended: 0640 root:root
+##
+## Notes:
+## - Gmail requires an application password
+## - for Gmail, `user` should be the full email address
+## - `from` should usually match the authenticated account
+## - if a script sends mail as root, aliases can still redirect it externally
+###
+cat > /etc/msmtprc <<'EOF'
 ## Default settings
 defaults
 auth           on
 tls            on
 tls_trust_file /etc/ssl/certs/ca-certificates.crt
 logfile        /var/log/msmtp/msmtp.log
-syslog         LOG_MAIL
 aliases        /etc/aliases
 
 ## Gmail account
-##
-## Gmail -> Account -> Security -> Create password for application
 account        gmail
 host           smtp.gmail.com
 port           587
-from           ###EMAIL_ADDRESS###
-user           ###USERNAME###
-password       ###PASSWORD###
+from           youraccount@gmail.com
+user           youraccount@gmail.com
+password       YOUR_GMAIL_APP_PASSWORD
 
-## Add other account...
-
-## Set default account
+## Default account
 account default : gmail
+EOF
+
+chmod 0640 /etc/msmtprc
+chown root:root /etc/msmtprc
+
+
+###
+## 4. Create log path
+##
+## Important:
+## - msmtp does NOT run as a dedicated daemon user here
+## - it runs as the user invoking `mail` / `sendmail`
+## - if the backup script runs as root, root must be able to write the log
+##
+## Correct ownership for a root-run script:
+###
+mkdir -p /var/log/msmtp
+touch /var/log/msmtp/msmtp.log
+chown root:adm /var/log/msmtp /var/log/msmtp/msmtp.log
+chmod 0755 /var/log/msmtp
+chmod 0640 /var/log/msmtp/msmtp.log
+
+
+###
+## 5. AppArmor
+##
+## If msmtp can send mail but cannot write the log file with:
+## - cannot log to /var/log/msmtp/msmtp.log: Permission denied
+##
+## then AppArmor must be extended.
+##
+## Do NOT edit the main profile directly if avoidable.
+## Use the local override file instead:
+## - /etc/apparmor.d/local/usr.bin.msmtp
+###
+mkdir -p /etc/apparmor.d/local
+
+cat > /etc/apparmor.d/local/usr.bin.msmtp <<'EOF'
+/var/log/msmtp/ wk,
+/var/log/msmtp/** wk,
+EOF
+
+apparmor_parser -r /etc/apparmor.d/usr.bin.msmtp
+
+
+###
+## 6. Logrotate
+##
+## File:
+## - /etc/logrotate.d/msmtp
+##
+## Notes:
+## - this rotates the local msmtp logfile
+## - ownership should match the runtime model above
+###
+cat > /etc/logrotate.d/msmtp <<'EOF'
+/var/log/msmtp/msmtp.log
+{
+    rotate 7
+    weekly
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 root adm
+}
+EOF
+
+
+###
+## 7. Test commands
+##
+## Test direct external recipient
+###
+echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" you@example.com
+
+###
+## Test alias resolution through root
+###
+echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" root
+
+###
+## Example mdadm monitor test
+###
+mdadm --monitor --scan --test --oneshot
+
+
+###
+## 8. Expected behavior
+##
+## Successful send may still show a log permission error if AppArmor or file permissions are wrong.
+##
+## Successful SMTP delivery is indicated by lines similar to:
+## - smtpstatus=250
+## - exitcode=EX_OK
+##
+## If that appears, mail delivery worked, and only logging failed.
+###
+
+
+###
+## 9. Troubleshooting
+##
+## Problem:
+## - `mail: command not found`
+## Fix:
+## - install bsd-mailx
+##
+## Problem:
+## - sendmail works, but log file write fails
+## Fix:
+## - check ownership and mode on /var/log/msmtp and msmtp.log
+## - if permissions are correct, adjust AppArmor local profile and reload it
+##
+## Problem:
+## - alias does not work
+## Fix:
+## - verify /etc/aliases syntax
+## - do not use invalid targets like `root@`
+## - use either a local alias name (`root`) or a full email address
+##
+## Problem:
+## - Gmail authentication fails
+## Fix:
+## - use a Gmail application password
+## - use the full Gmail address as `user`
+###
+
+
+###
+## 10. Minimal rule for backup scripts
+##
+## For scripts using:
+## - mail -s "subject" recipient < bodyfile
+##
+## this package set is sufficient:
+## - msmtp
+## - msmtp-mta
+## - bsd-mailx
+##
+## No full MTA is needed.
+###
