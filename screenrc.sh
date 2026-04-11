@@ -1,5 +1,3 @@
-#!/bin/bash
-
 ###
 # GNU Screen configuration file
 # Usage: Copy this file to ~/.screenrc
