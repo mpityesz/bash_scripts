@@ -1,7 +1,11 @@
+#!/bin/bash
+
+###
 # GNU Screen configuration file
 # Usage: Copy this file to ~/.screenrc
 # cp screenrc.sh ~/.screenrc
 # Alternative: Copy to /usr/local/sbin and create a symlink to this file
+###
 
 ###
 # COLORS AND TERMINAL SETTINGS
