@@ -13,7 +13,12 @@
 term screen-256color
 attrcolor b ".I"
 termcapinfo xterm 'Co#256:AB=\E[48;5;%dm:AF=\E[38;5;%dm'
+termcapinfo screen* 'Co#256:AB=\E[48;5;%dm:AF=\E[38;5;%dm'
 defbce on
+
+# MC color support
+setenv TERM screen-256color
+setenv COLORTERM truecolor
 
 ###
 # SCROLLBACK AND SCROLLING
@@ -56,15 +61,18 @@ vbell_msg "Bell!"
 # KEYBOARD COMMANDS
 ###
 
-# Show help: Ctrl+a then ?
-bind ? command -c help
-bind -c help h command -c help
-bind -c help ? other
+# Help is available with: Ctrl+a then ?
+# Reload config: Ctrl+a then r
+bind r source ~/.screenrc
 
 ###
-# USING SCROLLING
+# USAGE NOTES
 ###
-# 1. Press Ctrl+A then Esc - enters "copy mode"
-# 2. Scrolling: arrows, PgUp/PgDn, cursor movement
-# 3. Exit: Esc key
+# Scrolling:
+# 1. Press Ctrl+A then Esc (enters "copy mode")
+# 2. Use arrows, PgUp/PgDn for scrolling
+# 3. Press Esc to exit
+#
+# Important: Do not start screen from within MC or while MC is running
+# Start screen first, then run MC inside screen sessions
 ###
