@@ -1,67 +1,67 @@
 # GNU Screen configuration file
-# Használat: Másold ezt a fájlt a ~/.screenrc helyre
+# Usage: Copy this file to ~/.screenrc
 # cp screenrc.sh ~/.screenrc
 
 ###
-# SZÍNEK ÉS TERMINAL BEÁLLÍTÁSOK
+# COLORS AND TERMINAL SETTINGS
 ###
 
-# 256 színes támogatás engedélyezése
+# Enable 256 color support
 term screen-256color
 attrcolor b ".I"
 termcapinfo xterm 'Co#256:AB=\E[48;5;%dm:AF=\E[38;5;%dm'
 defbce on
 
 ###
-# SCROLLBACK ÉS GÖRGETÉS
+# SCROLLBACK AND SCROLLING
 ###
 
-# Scrollback buffer mérete (10000 sor)
-# Ez határozza meg, hogy mennyi korábbi kimenetet tudsz visszagörgetni
+# Scrollback buffer size (10000 lines)
+# This determines how much previous output you can scroll back through
 defscrollback 10000
 
-# Egér görgetés engedélyezése xterm-ben
-# Ezzel a beállítással működni fog a scroll wheel
+# Enable mouse scrolling in xterm
+# With this setting the scroll wheel will work
 termcapinfo xterm* ti@:te@
 
 ###
-# STÁTUSZ SOR
+# STATUS BAR
 ###
 
-# Státusz sor megjelenítése az alsó részen
+# Display status bar at the bottom
 hardstatus alwayslastline
 hardstatus string '%{= kG}[ %{G}%H %{g}][%= %{= kw}%?%-Lw%?%{r}(%{W}%n*%f%t%?(%u)%?%{r})%{w}%?%+Lw%?%?%= %{g}][%{B} %m-%d %{W}%c %{g}]'
 
 ###
-# ÁLTALÁNOS BEÁLLÍTÁSOK
+# GENERAL SETTINGS
 ###
 
-# UTF-8 támogatás
+# UTF-8 support
 defutf8 on
 
-# Automatikus leválasztás (detach) hangup esetén
+# Automatic detach on hangup
 autodetach on
 
-# Indulási üzenet kikapcsolása
+# Disable startup message
 startup_message off
 
-# Vizuális csengő (hangjelzés helyett)
+# Visual bell (instead of audio notification)
 vbell on
 vbell_msg "Bell!"
 
 ###
-# BILLENTYŰPARANCSOK
+# KEYBOARD COMMANDS
 ###
 
-# Súgó megjelenítése: Ctrl+a majd ?
+# Show help: Ctrl+a then ?
 bind ? command -c help
 bind -c help h command -c help
 bind -c help ? other
 
 ###
-# GÖRGETÉS HASZNÁLATA
+# USING SCROLLING
 ###
-# 1. Nyomj Ctrl+A majd Esc-et - belép a "copy mode"-ba
-# 2. Görgetés: nyilak, PgUp/PgDn, kurzor mozgatás
-# 3. Kilépés: Esc gomb
+# 1. Press Ctrl+A then Esc - enters "copy mode"
+# 2. Scrolling: arrows, PgUp/PgDn, cursor movement
+# 3. Exit: Esc key
 ###
