@@ -320,7 +320,7 @@ extract() {
 Usage: extract <archive> [destination-directory]
 
 Extracts <archive> into [destination-directory] (default: current
-directory; created automatically if it doesn't exist).
+directory; created automatically if it does not exist).
 
 Supported formats:
   .tar  .tar.gz/.tgz  .tar.bz2/.tbz2  .tar.xz/.txz  .tar.zst
@@ -384,15 +384,15 @@ compress() {
         cat <<'EOF'
 Usage: compress <output-archive> <file-or-directory> [more...]
 
-The archive type is picked from <output-archive>'s extension.
+The archive type is picked from the extension of output-archive.
 
 Supported: .tar  .tar.gz/.tgz  .tar.bz2/.tbz2  .tar.xz/.txz  .tar.zst
            .zip  .7z
 
 Example: compress backup.tar.gz ~/project
 
-(.rar is not supported for creation - "unrar" can only extract RAR
-archives, not create them.)
+(.rar is not supported for creation: the unrar tool can only extract
+RAR archives, it cannot create them.)
 EOF
         return 0
     fi
