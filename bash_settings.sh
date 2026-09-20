@@ -262,13 +262,31 @@ alias meminfo='free -h -l -t'
 alias cpuinfo='lscpu'
 # "column" ships in bsdmainutils (Debian 9-10) / bsdextrautils (11+) -
 # usually present, but missing on a --no-install-recommends install or
-# a minimal debootstrap. Without this check, "mount" itself would fail
-# every time (the alias runs "mount | column -t" as one pipeline, so a
-# missing column breaks even plain mount).
+# a minimal debootstrap.
+#
+# IMPORTANT: this is deliberately a FUNCTION, not a plain alias. A plain
+# "alias mount='mount | column -t'" is broken for real use: bash alias
+# expansion only replaces the first word, so any arguments you type get
+# stuck onto the END of the whole pipeline, not passed to the real
+# mount binary. "mount /dev/sdb1 /mnt/usb" would actually run as
+# "mount | column -t /dev/sdb1 /mnt/usb" - the real mount runs with NO
+# arguments, and /dev/sdb1 + /mnt/usb get handed to "column" as if they
+# were text files to read. column then tries to read the raw block
+# device /dev/sdb1 byte-by-byte looking for line breaks, which on a
+# real disk can run for a very long time - this is exactly what looked
+# like "mount hangs and does nothing." The function below only takes
+# the pretty-printing path when called with zero arguments; any actual
+# "mount <device> <target>" call goes straight to the real command.
 if _have column; then
-    alias mount='mount | column -t'
+    mount() {
+        if [ "$#" -eq 0 ]; then
+            command mount | column -t
+        else
+            command mount "$@"
+        fi
+    }
 else
-    _bs_missing+=("mount: 'column' not found, left unaliased so plain mount still works (apt install bsdextrautils)")
+    _bs_missing+=("mount: 'column' not found, plain mount used without pretty-printing (apt install bsdextrautils)")
 fi
 
 # Directory size
