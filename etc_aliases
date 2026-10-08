@@ -1,5 +1,22 @@
 # /etc/aliases
+#
+# Local mail recipients, used by msmtp (see `aliases` in /etc/msmtprc).
+# Template for Debian 12 / 13 hosts using msmtp + msmtp-mta, no full MTA.
+#
+# Notes:
+# - msmtp reads this file directly, `newaliases` is not needed
+# - format: one "name: target" per line, comments on their own lines only
+# - target is either a local alias name (root) or a full email address,
+#   never something like `root@`
+# - replace email@address.tld with the real admin address
+# - replace ADMINUSER with the admin account name of the host
+# - back up the existing file first:
+#     cp -a /etc/aliases /etc/aliases.bkp.$(date +%Y%m%d%H%M)
+
+# Fallback for any recipient not listed below
 default: email@address.tld
+
+# Standard system and role addresses
 mailer-daemon: root
 postmaster: root
 nobody: root
@@ -12,5 +29,9 @@ ftp: root
 abuse: root
 noc: root
 security: root
-user1: root
+
+# Admin account of this host
+ADMINUSER: root
+
+# Final destination of all local mail
 root: email@address.tld
