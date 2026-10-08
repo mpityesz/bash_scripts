@@ -1,0 +1,17 @@
+###
+# /etc/cron.d/integrity-watch - schedule for integrity-watch.sh
+#
+# Install: install -o root -g root -m 644 integrity-watch.cron /etc/cron.d/integrity-watch
+# Note: files in /etc/cron.d must not contain a dot in their name, or cron
+# ignores them. flock prevents overlapping runs if one run is slow.
+###
+
+# Compare with the baseline every 5 minutes
+*/5 * * * * root flock -n /run/integrity-watch.lock /usr/local/sbin/integrity-watch.sh check >/dev/null 2>&1
+
+# Web roots scan once an hour (does nothing if WEB_ROOTS is empty)
+17 * * * * root flock -n /run/integrity-watch-web.lock /usr/local/sbin/integrity-watch.sh webcheck >/dev/null 2>&1
+
+# Daily heartbeat with full package verification; if this mail stops
+# arriving, the monitor or mail delivery is broken
+0 7 * * * root flock -w 600 /run/integrity-watch.lock /usr/local/sbin/integrity-watch.sh heartbeat >/dev/null 2>&1
