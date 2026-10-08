@@ -31,9 +31,9 @@
 #     This matters with queueless senders like msmtp, where a failed mail
 #     is lost. Check with:
 #       journalctl -t ssh-login-alert
-#   - Connections that open no session (e.g. ProxyJump / ssh -W port
-#     forwarding without a shell) may not trigger this alert, depending on
-#     the sshd version. Test it on the target host.
+#   - ProxyJump / ssh -W connections (port forwarding without a shell) also
+#     trigger the alert: sshd opens the PAM session for them too
+#     (verified on Debian 13, OpenSSH 10.0). The tty field shows "ssh".
 #   - With SSH connection multiplexing (ControlMaster) only the first
 #     connection opens a PAM session; later channels reuse it.
 #
