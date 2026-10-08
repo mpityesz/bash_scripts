@@ -1,25 +1,54 @@
 ###
-## MSMTP + mailx setup Debian 12 / Debian 13
+## MSMTP + mailx setup for Debian 12 (bookworm) / Debian 13 (trixie)
 ##
 ## Goal:
-## - local scripts can send notification emails
-## - no full MTA (Postfix/Exim) needed
-## - external SMTP relay is used (for example Gmail)
+## - local scripts and system services (cron, sudo, PAM hooks,
+##   unattended-upgrades, rkhunter, mdadm, ...) can send notification emails
+## - no full MTA (Postfix/Exim) needed, no listening daemon, no open port
+## - an external SMTP relay is used (for example Gmail)
 ##
 ## Used packages:
-## - msmtp
-## - msmtp-mta
-## - bsd-mailx
+## - msmtp       : SMTP client that sends mail to the relay
+## - msmtp-mta   : provides /usr/sbin/sendmail compatibility
+## - bsd-mailx   : provides the `mail` command
 ##
-## Why this setup:
-## - bsd-mailx provides the `mail` command
-## - msmtp-mta provides sendmail compatibility
-## - msmtp sends mail through an external SMTP server
+## Limitations (know them before relying on this setup):
+## - NO QUEUE: if the relay is unreachable at send time, the mail is lost.
+##   Mitigation: send a daily "heartbeat" mail; if it does not arrive,
+##   either the host or mail delivery is broken.
+## - Gmail rewrites the From address to the authenticated account.
+##   Put the hostname into the subject line to identify the sender host.
+## - With /etc/msmtprc mode 0640 root:root only root can send mail
+##   (see section 3).
+##
+## Debian 12 vs 13: the steps below are the same on both releases.
+## Release-specific notes are marked with "[Debian 12]" / "[Debian 13]".
 ###
+
+
+###
+## 0. Backup existing files
+##
+## Convention: <file>.bkp.yyyymmddhhmm next to the original.
+## Safe here: msmtp reads only /etc/msmtprc and the aliases file named in it,
+## AppArmor only loads the local file included by name.
+###
+TS=$(date +%Y%m%d%H%M)
+for f in /etc/aliases /etc/msmtprc /etc/apparmor.d/local/usr.bin.msmtp; do
+    [ -f "$f" ] && cp -a "$f" "$f.bkp.$TS"
+done
 
 
 ###
 ## 1. Install packages
+##
+## Notes:
+## - msmtp-mta conflicts with other MTAs: installing it REMOVES an existing
+##   exim4 / postfix (exim4 is often pulled in as a dependency on a fresh
+##   install, listening on localhost:25). Do not do this on a host that must
+##   keep its full MTA.
+## - The msmtp package asks (debconf) whether to enable its AppArmor profile.
+##   Answer YES; then section 5 is mandatory.
 ###
 apt install msmtp msmtp-mta bsd-mailx
 
@@ -28,15 +57,20 @@ apt install msmtp msmtp-mta bsd-mailx
 ## 2. Configure aliases
 ##
 ## File:
-## - /etc/aliases
+## - /etc/aliases (template: etc_aliases in this repo)
 ##
 ## Notes:
-## - msmtp reads this file directly
+## - msmtp reads this file directly (see `aliases` in /etc/msmtprc)
 ## - `newaliases` is not needed in this setup
-## - local system recipients should resolve to root
-## - root should resolve to a real external email address
+## - local system recipients resolve to root
+## - root resolves to a real external email address
+## - replace ADMINUSER with the host's admin account name
+## - use either a local alias name (root) or a full email address as target,
+##   never something like `root@`
 ###
 cat > /etc/aliases <<'EOF'
+# Local mail recipients, used by msmtp (see /etc/msmtprc)
+# Fallback for any recipient not listed below
 default: email@address.tld
 mailer-daemon: root
 postmaster: root
@@ -50,7 +84,8 @@ ftp: root
 abuse: root
 noc: root
 security: root
-user1: root
+# Admin account of this host
+ADMINUSER: root
 root: email@address.tld
 EOF
 
@@ -62,13 +97,22 @@ EOF
 ## - /etc/msmtprc
 ##
 ## Permissions:
-## - recommended: 0640 root:root
+## - 0640 root:root (effectively the same as 0600): only root can read the
+##   config, so only processes running as root can send mail.
+##   This is intentional: it keeps the relay password away from other users.
+##   Typical senders (cron jobs of root, sudo, PAM hooks, unattended-upgrades,
+##   rkhunter, mdadm) all run as root.
+##   If a non-root script must send mail, run it via root's cron or sudo
+##   instead of loosening these permissions.
 ##
 ## Notes:
-## - Gmail requires an application password
-## - for Gmail, `user` should be the full email address
-## - `from` should usually match the authenticated account
-## - if a script sends mail as root, aliases can still redirect it externally
+## - Gmail requires an application password (the normal account password
+##   does not work); this needs 2-step verification on the Google account
+## - for Gmail, `user` must be the full email address
+## - `from` should match the authenticated account
+## - Logging alternative: instead of `logfile` you can use `syslog LOG_MAIL`
+##   and read the log with `journalctl -t msmtp`. Then sections 4, 5 and 6
+##   are not needed. The logfile variant below keeps a separate, rotated file.
 ###
 cat > /etc/msmtprc <<'EOF'
 ## Default settings
@@ -77,6 +121,7 @@ auth           on
 tls            on
 tls_trust_file /etc/ssl/certs/ca-certificates.crt
 logfile        /var/log/msmtp/msmtp.log
+# Map local recipients (root, admin user, ...) to external addresses
 aliases        /etc/aliases
 
 ## Gmail account
@@ -91,19 +136,17 @@ password       YOUR_GMAIL_APP_PASSWORD
 account default : gmail
 EOF
 
-chmod 0640 /etc/msmtprc
 chown root:root /etc/msmtprc
+chmod 0640 /etc/msmtprc
 
 
 ###
 ## 4. Create log path
 ##
 ## Important:
-## - msmtp does NOT run as a dedicated daemon user here
-## - it runs as the user invoking `mail` / `sendmail`
-## - if the backup script runs as root, root must be able to write the log
-##
-## Correct ownership for a root-run script:
+## - msmtp does NOT run as a daemon
+## - it runs as the user invoking `mail` / `sendmail`, here always root
+## - group adm allows admins to read the log without root
 ###
 mkdir -p /var/log/msmtp
 touch /var/log/msmtp/msmtp.log
@@ -115,18 +158,34 @@ chmod 0640 /var/log/msmtp/msmtp.log
 ###
 ## 5. AppArmor
 ##
-## If msmtp can send mail but cannot write the log file with:
-## - cannot log to /var/log/msmtp/msmtp.log: Permission denied
+## AppArmor is enabled by default on Debian 12 and 13.
+## If the msmtp profile is in enforce mode, it does NOT allow writing to
+## /var/log/msmtp/. Mail is still delivered, but the log stays empty,
+## which is easy to miss. So check this BEFORE testing, not only on error.
 ##
-## then AppArmor must be extended.
+## 5.1 Check whether the profile is loaded and enforced
+###
+aa-status | sed -n '/enforce mode/,/complain mode/p' | grep msmtp
+# Output "msmtp" (and "msmtp//helpers") -> enforced, continue with 5.2
+# No output -> profile not enforced (AppArmor support declined at install),
+#              skip the rest of section 5
+
+###
+## 5.2 Check the name of the local override file
 ##
-## Do NOT edit the main profile directly if avoidable.
-## Use the local override file instead:
-## - /etc/apparmor.d/local/usr.bin.msmtp
+## Note: in AppArmor profiles `#include <...>` (with the hash) is the old
+## include syntax and is ACTIVE, not a comment.
+## Do NOT edit the main profile; package updates would overwrite it.
+###
+grep -n 'local' /etc/apparmor.d/usr.bin.msmtp
+# Expected: #include <local/usr.bin.msmtp>
+
+###
+## 5.3 Allow the log directory and reload the profile
 ###
 mkdir -p /etc/apparmor.d/local
-
 cat > /etc/apparmor.d/local/usr.bin.msmtp <<'EOF'
+# Allow msmtp to write its own log directory (see logfile in /etc/msmtprc)
 /var/log/msmtp/ wk,
 /var/log/msmtp/** wk,
 EOF
@@ -138,24 +197,26 @@ apparmor_parser -r /etc/apparmor.d/usr.bin.msmtp
 ## 6. Logrotate
 ##
 ## File:
-## - /etc/logrotate.d/msmtp
+## - /etc/logrotate.d/msmtp (template: msmtp_logrotate.d in this repo)
 ##
 ## Notes:
-## - this rotates the local msmtp logfile
-## - ownership should match the runtime model above
+## - msmtp opens the logfile on every send, so no postrotate action is needed
+## - ownership matches section 4
 ###
 cat > /etc/logrotate.d/msmtp <<'EOF'
 /var/log/msmtp/msmtp.log
 {
-    rotate 7
-    weekly
-    missingok
-    notifempty
-    compress
-    delaycompress
-    create 0640 root adm
+	rotate 7
+	weekly
+	missingok
+	notifempty
+	compress
+	delaycompress
+	create 0640 root adm
 }
 EOF
+
+logrotate --debug /etc/logrotate.d/msmtp
 
 
 ###
@@ -163,29 +224,35 @@ EOF
 ##
 ## Test direct external recipient
 ###
-echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" you@example.com
+echo "MSMTP test message from $(hostname -f) at $(date)" | mail -s "[$(hostname -s)] msmtp test" you@example.com
 
 ###
 ## Test alias resolution through root
 ###
-echo "MSMTP Test Message $(hostname -f)" | mail -s "MSMTP Test Message $(hostname -f)" root
+echo "MSMTP test message from $(hostname -f) at $(date)" | mail -s "[$(hostname -s)] msmtp test" root
 
 ###
-## Example mdadm monitor test
+## Check the log
 ###
-mdadm --monitor --scan --test --oneshot
+tail -n 5 /var/log/msmtp/msmtp.log
+
+###
+## Optional, only on hosts with software RAID: mdadm monitor test
+###
+# mdadm --monitor --scan --test --oneshot
 
 
 ###
 ## 8. Expected behavior
 ##
-## Successful send may still show a log permission error if AppArmor or file permissions are wrong.
-##
-## Successful SMTP delivery is indicated by lines similar to:
+## Successful SMTP delivery is indicated in the log by:
 ## - smtpstatus=250
 ## - exitcode=EX_OK
+## and the mail arrives at the address set for root in /etc/aliases.
 ##
-## If that appears, mail delivery worked, and only logging failed.
+## Mail can be delivered successfully while logging fails
+## (AppArmor or file permissions). An empty log after a successful test
+## means section 4 or 5 is wrong.
 ###
 
 
@@ -198,15 +265,18 @@ mdadm --monitor --scan --test --oneshot
 ## - install bsd-mailx
 ##
 ## Problem:
-## - sendmail works, but log file write fails
+## - mail is delivered, but the log stays empty or shows
+##   "cannot log to /var/log/msmtp/msmtp.log: Permission denied"
 ## Fix:
-## - check ownership and mode on /var/log/msmtp and msmtp.log
-## - if permissions are correct, adjust AppArmor local profile and reload it
+## - check ownership and mode on /var/log/msmtp and msmtp.log (section 4)
+## - check AppArmor denials:
+##     journalctl -k | grep -i 'apparmor="DENIED"' | grep msmtp
+## - extend the local AppArmor profile and reload it (section 5)
 ##
 ## Problem:
 ## - alias does not work
 ## Fix:
-## - verify /etc/aliases syntax
+## - verify /etc/aliases syntax (one "name: target" per line)
 ## - do not use invalid targets like `root@`
 ## - use either a local alias name (`root`) or a full email address
 ##
@@ -215,14 +285,27 @@ mdadm --monitor --scan --test --oneshot
 ## Fix:
 ## - use a Gmail application password
 ## - use the full Gmail address as `user`
+##
+## Problem:
+## - a non-root user or script cannot send mail
+##   ("cannot read /etc/msmtprc" or similar)
+## Fix:
+## - expected with 0640 root:root (section 3); run the sender as root
+##
+## Problem:
+## - an expected mail never arrived, no error visible
+## Fix:
+## - there is no queue: check the log at the time of sending for a failure
+##   (relay unreachable, TLS or auth error); the mail must be resent
 ###
 
 
 ###
-## 10. Minimal rule for backup scripts
+## 10. Minimal rule for scripts
 ##
 ## For scripts using:
 ## - mail -s "subject" recipient < bodyfile
+## - or /usr/sbin/sendmail directly
 ##
 ## this package set is sufficient:
 ## - msmtp
