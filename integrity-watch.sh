@@ -355,8 +355,10 @@ collect_runtime() {
     done | sort -u
 
     # Firewall: active ruleset without counters and without set elements
-    # (dynamic blocklists change constantly; their definitions still count)
-    if have nft; then
+    # (dynamic blocklists change constantly; their definitions still count).
+    # Only if nf_tables is already loaded: running nft would load the kernel
+    # module itself, and the monitor must not change what it measures.
+    if have nft && grep -q '^nf_tables ' /proc/modules 2>/dev/null; then
         nft -s list ruleset 2>/dev/null \
             | awk '/elements = \{/ {skip = 1} skip && /\}/ {skip = 0; next} !skip' \
             | sed 's/^[[:space:]]*//' | grep -v '^$' | sed 's/^/nft /'
