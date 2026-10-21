@@ -290,7 +290,8 @@ evaluate_settings() {
 
   if [ "$status" = fixed ]; then
     if [ "$mem" = "-1" ]; then
-      advise "This version is patched: memory_limit = -1 is no longer needed, restore a finite value (e.g. 256M)."
+      info "(memory_limit = -1: if you set this as a temporary PHP2Shell mitigation, restore the previous finite value;"
+      info " if it was configured like this before (e.g. the ISPConfig panel pool), leave it as is.)"
     fi
     if [ "$upload" != "n/a" ] && is_on "$upload"; then
       info "(Optional hardening: session.upload_progress.enabled = 0, hardly any application uses it.)"
@@ -602,6 +603,16 @@ report_pool() {
   vhosts=${SOCKET_VHOSTS[$norm]:-}
 
   printf '\n  %s[%s]%s %s\n' "$C_BOLD" "$pool_name" "$C_RESET" "$pool_file"
+  if [ -z "${BIN_VERSION[$key]+x}" ]; then
+    if [ -n "$vhosts" ]; then
+      warn "leftover pool: its PHP-FPM binary ($fpm_bin) is not installed, but vhosts point here: $vhosts"
+      COUNT_DOWN_POOLS=$((COUNT_DOWN_POOLS+1)); raise_exit 1
+    else
+      info "${C_DIM}leftover config: PHP-FPM binary $fpm_bin is not installed, nothing runs this pool (not a risk).${C_RESET}"
+      info "${C_DIM}To clean up: dpkg -l | awk '/^rc/ && \$2 ~ /php/ {print \$2}'  then  apt purge <packages>${C_RESET}"
+    fi
+    return 0
+  fi
   printf '          PHP %s %s | FPM: %s | listen: %s\n' "${version%%[-~+]*}" "$(status_label "$status")" "$running" "$listen"
   info "vhosts: ${vhosts:-(no vhost in the web server config points here)}"
 
@@ -663,14 +674,29 @@ for pool_file in "${POOL_FILES[@]}"; do
 done
 [ "$pool_count" = 0 ] && info "No PHP-FPM pool configuration found."
 
-unmatched=""
+COUNT_UNMATCHED=0
 for sock in "${!SOCKET_VHOSTS[@]}"; do
-  [ -z "${SOCKET_MATCHED[$sock]+x}" ] && unmatched+="    $sock  <-  ${SOCKET_VHOSTS[$sock]}"$'\n'
+  [ -n "${SOCKET_MATCHED[$sock]+x}" ] && continue
+  if [ "$COUNT_UNMATCHED" = 0 ]; then
+    printf '\n'; warn "FastCGI addresses used by vhosts but not matched to any pool file: their PHP was NOT audited"
+  fi
+  COUNT_UNMATCHED=$((COUNT_UNMATCHED+1))
+  info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
+  owner=""
+  if command -v ss >/dev/null 2>&1; then
+    if [[ $sock == /* ]]; then
+      owner=$(ss -lxpH 2>/dev/null | awk -v s="$sock" '$0 ~ s {print $NF; exit}')
+    elif [[ $sock =~ :([0-9]+)$ ]]; then
+      owner=$(ss -ltnpH "sport = :${BASH_REMATCH[1]}" 2>/dev/null | awk '{print $NF; exit}')
+    fi
+  fi
+  info "${C_DIM}listening process: ${owner:-none found (nothing listens, or another host/container)}${C_RESET}"
+  case $owner in
+    *docker-proxy*|*containerd*|*conmon*)
+      advise "Served by a container: update its image (docker pull + recreate) and check the PHP version inside it." ;;
+  esac
 done
-if [ -n "$unmatched" ]; then
-  printf '\n'; warn "FastCGI addresses referenced by the web server but not matched to any pool file (check manually):"
-  printf '%s' "$unmatched"
-fi
+[ "$COUNT_UNMATCHED" -gt 0 ] && raise_exit 1
 
 # =============================================================================
 header "5. Other PHP handlers: mod_php and FastCGI/fcgid"
@@ -776,6 +802,7 @@ else
   [ "$COUNT_STALE_OTHER" -gt 0 ]    && warn "Other processes still running a replaced PHP binary: $COUNT_STALE_OTHER"
   [ "$COUNT_PENDING_CONFIG" -gt 0 ] && warn "Config changes waiting for a reload: $COUNT_PENDING_CONFIG"
   [ "$COUNT_DOWN_POOLS" -gt 0 ]     && warn "Pools used by vhosts whose PHP-FPM is not running: $COUNT_DOWN_POOLS"
+  [ "${COUNT_UNMATCHED:-0}" -gt 0 ] && warn "FastCGI addresses whose PHP could not be audited: $COUNT_UNMATCHED"
   [ "$COUNT_VULN_INSTALLED" -gt 0 ] && warn "Vulnerable or unverifiable installed PHP binaries/modules in total: $COUNT_VULN_INSTALLED"
 
   cat <<'EOF'
