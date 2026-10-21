@@ -10,9 +10,11 @@
 #
 # Exit codes:
 #   0 = every running PHP is patched, nothing to do
-#   1 = a vulnerable PHP is installed, but it is not running / not used by a web server
-#   2 = a vulnerable PHP is serving requests, OR the package is patched but the
-#       old (not restarted) process is still running
+#   1 = warnings: a vulnerable PHP is installed but not serving requests,
+#       a non-web process still runs a replaced PHP binary, or a config
+#       change is waiting for a reload
+#   2 = a vulnerable (or unverifiable) PHP is serving requests, OR the package
+#       is patched but the old (not restarted) process is still running
 #
 # Official fixed releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12.
 # Older branches (5.6, 7.x, 8.0, 8.1) can only be fixed by a distribution /
@@ -46,6 +48,7 @@ command -v dpkg-query >/dev/null 2>&1 && HAVE_DPKG=1
 [ "$HAVE_DPKG" = 0 ] && command -v rpm >/dev/null 2>&1 && HAVE_RPM=1
 
 COUNT_VULN_RUNNING=0; COUNT_NEEDS_RESTART=0; COUNT_VULN_INSTALLED=0
+COUNT_STALE_OTHER=0; COUNT_PENDING_CONFIG=0; COUNT_DOWN_POOLS=0
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -85,28 +88,40 @@ package_version() {
   elif [ "$HAVE_RPM" = 1 ]; then rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null; fi
 }
 
-changelog_has_fix() {   # true if the package changelog references the CVEs
-  local pkg=${1%%:*} base="" dir file
+package_candidate() {   # newest version known to the local apt cache (dpkg only)
+  [ "$HAVE_DPKG" = 1 ] && command -v apt-cache >/dev/null 2>&1 || return 0
+  apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ && $2 != "(none)" {print $2; exit}'
+}
+
+# 0 = changelog references the CVEs, 1 = it does not, 2 = no changelog available to check
+changelog_has_fix() {
+  local pkg=${1%%:*} base="" dir file seen=0 log
   if [ "$HAVE_DPKG" = 1 ]; then
     [[ $pkg =~ (php[0-9]+(\.[0-9]+)?) ]] && base=${BASH_REMATCH[1]}
     for dir in "/usr/share/doc/$pkg" ${base:+"/usr/share/doc/$base-common"}; do
       for file in "$dir/changelog.Debian.gz" "$dir/changelog.gz" "$dir/NEWS.Debian.gz"; do
-        [ -r "$file" ] && zgrep -Eq "$CVE_RE" "$file" 2>/dev/null && return 0
+        [ -r "$file" ] || continue
+        seen=1
+        zgrep -Eq "$CVE_RE" "$file" 2>/dev/null && return 0
       done
     done
-    return 1
+    [ "$seen" = 1 ] && return 1
+    return 2
   elif [ "$HAVE_RPM" = 1 ]; then
-    rpm -q --changelog "$pkg" 2>/dev/null | grep -Eq "$CVE_RE"
-  else
+    log=$(rpm -q --changelog "$pkg" 2>/dev/null)
+    [ -n "$log" ] || return 2
+    grep -Eq "$CVE_RE" <<<"$log" && return 0
     return 1
   fi
+  return 2
 }
 
 status_label() {
   case $1 in
-    fixed) printf '%sPATCHED%s' "$C_GREEN" "$C_RESET" ;;
-    pre54) printf '%sEOL (pre-5.4)%s' "$C_YELLOW" "$C_RESET" ;;
-    *)     printf '%sVULNERABLE%s' "$C_RED" "$C_RESET" ;;
+    fixed)      printf '%sPATCHED%s' "$C_GREEN" "$C_RESET" ;;
+    pre54)      printf '%sEOL (pre-5.4)%s' "$C_YELLOW" "$C_RESET" ;;
+    unverified) printf '%sUNVERIFIED%s' "$C_YELLOW" "$C_RESET" ;;
+    *)          printf '%sVULNERABLE%s' "$C_RED" "$C_RESET" ;;
   esac
 }
 
@@ -130,6 +145,17 @@ process_start_time() {   # process start time (epoch seconds)
   [ -n "$start_ticks" ] && [ -n "$boot_time" ] && echo $(( boot_time + start_ticks / hz ))
 }
 
+parent_pid() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $2}'; }
+
+# Prints the files (from $2...) modified after the epoch time in $1
+changed_since() {
+  local start=$1 file; shift
+  for file in "$@"; do
+    [ -e "$file" ] && [ "$(stat -c %Y "$file" 2>/dev/null || echo 0)" -gt "$start" ] && printf '%s ' "$file"
+  done
+  return 0
+}
+
 # Last effective assignment of a key in the given ini files
 ini_get() {
   local key=$1; shift
@@ -150,7 +176,7 @@ declare -A BIN_VERSION BIN_SAPI BIN_PKG BIN_PKG_VERSION BIN_STATUS BIN_NOTE BIN_
 BIN_ORDER=()
 
 classify_binary() {   # $1 = key; BIN_VERSION[$1] must already be set
-  local key=$1 status pkg
+  local key=$1 status pkg rc=1 candidate
   pkg=$(package_of_file "$key"); BIN_PKG[$key]=$pkg; BIN_PKG_VERSION[$key]=""
   [ -n "$pkg" ] && BIN_PKG_VERSION[$key]=$(package_version "$pkg")
   status=$(upstream_status "${BIN_VERSION[$key]}")
@@ -159,16 +185,30 @@ classify_binary() {   # $1 = key; BIN_VERSION[$1] must already be set
     pre54) BIN_STATUS[$key]=pre54
            BIN_NOTE[$key]="pre-5.4, EOL; the official advisory lists 5.4+ as affected, session.upload_progress does not exist here" ;;
     *)
-      if [ -n "$pkg" ] && changelog_has_fix "$pkg"; then
+      if [ -n "$pkg" ]; then changelog_has_fix "$pkg"; rc=$?; fi
+      if [ "$rc" = 0 ]; then
         BIN_STATUS[$key]=fixed; BIN_NOTE[$key]="backported fix (package changelog references the CVEs)"
       elif [ -z "$pkg" ]; then
         BIN_STATUS[$key]=vuln; BIN_NOTE[$key]="not installed from a package (custom build?): patched only if it was patched manually"
+      elif [ "$rc" = 2 ]; then
+        BIN_STATUS[$key]=unverified
+        if [ "$HAVE_DPKG" = 1 ]; then
+          BIN_NOTE[$key]="cannot verify: the package changelog is not installed; check with: apt changelog $pkg | grep -E '$CVE_RE'"
+        else
+          BIN_NOTE[$key]="cannot verify: no changelog in the RPM database; check the vendor advisory for $pkg"
+        fi
       elif [ "$status" = eol ]; then
         BIN_STATUS[$key]=vuln; BIN_NOTE[$key]="EOL branch, no CVE reference in the package changelog (no backport)"
       else
         BIN_STATUS[$key]=vuln; BIN_NOTE[$key]="below the fixed release, and no CVE reference in the changelog"
       fi ;;
   esac
+  if [ "${BIN_STATUS[$key]}" != fixed ] && [ -n "$pkg" ]; then
+    candidate=$(package_candidate "$pkg")
+    if [ -n "$candidate" ] && [ "$candidate" != "${BIN_PKG_VERSION[$key]}" ]; then
+      BIN_NOTE[$key]+="; newer package in the apt cache: $candidate"
+    fi
+  fi
 }
 
 # The binary's own php.ini and conf.d directory (parsed from -i output, HTML or text)
@@ -227,10 +267,15 @@ probe_module() {    # Apache mod_php module
   fi
 }
 
+ini_files_of() {   # $1 binary key -> fills the global array INI_LIST
+  local IFS='|'
+  INI_LIST=()
+  read -ra INI_LIST <<<"${BIN_INI_FILES[$1]:-}"
+}
+
 ini_of_binary() {  # $1 binary key, $2 ini key -> value (or empty)
-  local files=() IFS='|'
-  read -ra files <<<"${BIN_INI_FILES[$1]:-}"
-  ini_get "$2" ${files[@]+"${files[@]}"}
+  ini_files_of "$1"
+  ini_get "$2" ${INI_LIST[@]+"${INI_LIST[@]}"}
 }
 
 # -----------------------------------------------------------------------------
@@ -321,7 +366,10 @@ else
   while IFS=$'\t' read -r pkg version; do
     status=$(upstream_status "$version"); origin=""
     [[ $version == *sury* ]] && origin=" [sury.org]"
-    [ "$status" != fixed ] && changelog_has_fix "$pkg" && status=fixed
+    if [ "$status" != fixed ] && [ "$status" != pre54 ]; then
+      changelog_has_fix "$pkg"
+      case $? in 0) status=fixed ;; 2) status=unverified ;; esac
+    fi
     printf '  %-30s %-38s %s%s\n' "$pkg" "$version" "$(status_label "$status")" "$origin"
   done <<<"$PACKAGE_LINES"
 fi
@@ -344,7 +392,7 @@ if [ ${#BIN_ORDER[@]} -eq 0 ]; then
   info "No PHP binary found."
 else
   for key in "${BIN_ORDER[@]}"; do
-    printf '  %-42s %-15s %-12s %s\n' "$key" "${BIN_SAPI[$key]}" "${BIN_VERSION[$key]}" "$(status_label "${BIN_STATUS[$key]}")"
+    printf '  %-42s %-15s %-12s %s\n' "$key" "${BIN_SAPI[$key]}" "${BIN_VERSION[$key]%%[-~+]*}" "$(status_label "${BIN_STATUS[$key]}")"
     info "${C_DIM}package: ${BIN_PKG[$key]:--} ${BIN_PKG_VERSION[$key]} | ${BIN_NOTE[$key]}${C_RESET}"
     [ "${BIN_STATUS[$key]}" != fixed ] && COUNT_VULN_INSTALLED=$((COUNT_VULN_INSTALLED+1))
   done
@@ -353,27 +401,43 @@ fi
 
 # =============================================================================
 header "3. Running PHP processes (what actually serves requests)"
-declare -A RUNNING_BIN
+declare -A RUNNING_BIN RUNNING_START CHECKED_PIDS MASTER_CONF_BIN
 MODPHP_LOADED=0
 
-check_running() {   # $1 pid, $2 description, $3 binary/module path (may end in "(deleted)")
-  local pid=$1 desc=$2 path=$3 clean_path deleted=0 start mtime key
+# $1 pid, $2 description, $3 binary/module path (may end in "(deleted)"), $4.. extra config files
+check_running() {
+  local pid=$1 desc=$2 path=$3 clean_path deleted=0 start mtime key; shift 3
+  CHECKED_PIDS[$pid]=1
   clean_path=${path% (deleted)}; [ "$clean_path" != "$path" ] && deleted=1
   key=$(readlink -f "$clean_path" 2>/dev/null || echo "$clean_path")
   if [[ $key == *.so ]]; then probe_module "$key"; else probe_binary "$key" || true; fi
   RUNNING_BIN[$key]=1
   start=$(process_start_time "$pid"); mtime=$(stat -c %Y "$key" 2>/dev/null || echo 0)
+  if [ -n "$start" ] && { [ -z "${RUNNING_START[$key]:-}" ] || [ "$start" -lt "${RUNNING_START[$key]}" ]; }; then
+    RUNNING_START[$key]=$start
+  fi
   local needs_restart=0
   { [ "$deleted" = 1 ] || { [ -n "$start" ] && [ "$mtime" -gt "$start" ]; }; } && needs_restart=1
-  local status=${BIN_STATUS[$key]:-vuln}
+  local status=${BIN_STATUS[$key]:-vuln} version=${BIN_VERSION[$key]:-?}
+  version=${version%%[-~+]*}
   if [ "$status" = fixed ] && [ "$needs_restart" = 1 ]; then
-    bad "$desc (PID $pid): patched ${BIN_VERSION[$key]:-} is on disk, but the process still runs the OLD binary -> restart required"
+    bad "$desc (PID $pid): patched $version is on disk, but the process still runs the OLD binary -> restart required"
     COUNT_NEEDS_RESTART=$((COUNT_NEEDS_RESTART+1)); raise_exit 2
   elif [ "$status" = fixed ]; then
-    ok "$desc (PID $pid): ${BIN_VERSION[$key]:-} $(status_label fixed)"
+    ok "$desc (PID $pid): $version $(status_label fixed)"
   else
-    bad "$desc (PID $pid): ${BIN_VERSION[$key]:-?} $(status_label "$status") (${key})"
+    bad "$desc (PID $pid): $version $(status_label "$status") (${key})"
     COUNT_VULN_RUNNING=$((COUNT_VULN_RUNNING+1)); raise_exit 2
+  fi
+
+  # Config files changed after the process started are not active yet
+  if [ -n "$start" ]; then
+    ini_files_of "$key"
+    local changed; changed=$(changed_since "$start" ${INI_LIST[@]+"${INI_LIST[@]}"} "$@")
+    if [ -n "$changed" ]; then
+      warn "  config changed after this process started, NOT active until reload/restart: $changed"
+      COUNT_PENDING_CONFIG=$((COUNT_PENDING_CONFIG+1)); raise_exit 1
+    fi
   fi
 }
 
@@ -381,9 +445,16 @@ found_any=0
 for pid in $(pgrep -f 'php-fpm: master process' 2>/dev/null); do
   exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
   conf=$(tr '\0' ' ' <"/proc/$pid/cmdline" | sed -n 's/.*(\(.*\)).*/\1/p')
-  check_running "$pid" "PHP-FPM master ${conf:+[$conf]}" "$exe"; found_any=1
+  if [ -n "$conf" ]; then
+    MASTER_CONF_BIN[$conf]=$(readlink -f "${exe% (deleted)}" 2>/dev/null || echo "${exe% (deleted)}")
+    check_running "$pid" "PHP-FPM master [$conf]" "$exe" "$conf"
+  else
+    check_running "$pid" "PHP-FPM master" "$exe"
+  fi
+  found_any=1
 done
 for pid in $(pgrep -o -x 'apache2|httpd' 2>/dev/null); do
+  CHECKED_PIDS[$pid]=1
   info "Apache is running (PID $pid)"
   while read -r so; do
     check_running "$pid" "Apache mod_php" "$so"; found_any=1; MODPHP_LOADED=1
@@ -391,12 +462,41 @@ for pid in $(pgrep -o -x 'apache2|httpd' 2>/dev/null); do
 done
 declare -A CGI_SEEN
 for pid in $(pgrep -f 'php-cgi|php[0-9.]*-cgi' 2>/dev/null); do
+  CHECKED_PIDS[$pid]=1
   exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
   [ -n "${CGI_SEEN[$exe]+x}" ] && continue; CGI_SEEN[$exe]=1
   check_running "$pid" "php-cgi (FastCGI/fcgid)" "$exe"; found_any=1
 done
 pgrep -x nginx >/dev/null 2>&1 && info "Nginx is running"
 [ "$found_any" = 0 ] && info "No PHP web process is running (PHP-FPM / mod_php / php-cgi)."
+
+# Any other process (queue workers, supervisor jobs, long cron jobs, FPM workers
+# of an unknown master...) that still runs a replaced PHP binary or extension
+printf '\n'
+SELF_PID=$$
+for proc_dir in /proc/[0-9]*; do
+  pid=${proc_dir#/proc/}
+  [ "$pid" = "$SELF_PID" ] && continue
+  [ -n "${CHECKED_PIDS[$pid]+x}" ] && continue
+  ppid=$(parent_pid "$pid")
+  [ -n "$ppid" ] && [ -n "${CHECKED_PIDS[$ppid]+x}" ] && continue   # workers of a master checked above
+  stale=""
+  exe=$(readlink "$proc_dir/exe" 2>/dev/null) || exe=""
+  case $exe in *php*" (deleted)") stale=${exe% (deleted)} ;; esac
+  if [ -z "$stale" ]; then
+    stale=$(awk '$6 ~ /php/ && $NF == "(deleted)" {print $6; exit}' "$proc_dir/maps" 2>/dev/null)
+  fi
+  [ -n "$stale" ] || continue
+  cmd=$(tr '\0' ' ' <"$proc_dir/cmdline" 2>/dev/null | cut -c1-100)
+  warn "PID $pid still uses a replaced PHP file ($stale): ${cmd:-?}"
+  COUNT_STALE_OTHER=$((COUNT_STALE_OTHER+1))
+done
+if [ "$COUNT_STALE_OTHER" -gt 0 ]; then
+  advise "Restart these processes (supervisor / queue workers / services that own them)."
+  raise_exit 1
+else
+  ok "No other process runs a replaced PHP binary or extension."
+fi
 
 # =============================================================================
 # Collect vhosts: socket -> vhosts, fcgid starters, mod_php vhosts
@@ -438,9 +538,27 @@ done
 
 # =============================================================================
 header "4. PHP-FPM pools, their vhosts and recommended settings"
-POOL_FILES=(/etc/php/*/fpm/pool.d/*.conf /etc/php5/fpm/pool.d/*.conf /opt/*/etc/php-fpm.d/*.conf \
-            /etc/php-fpm.d/*.conf /etc/opt/remi/*/php-fpm.d/*.conf)
-declare -A SOCKET_MATCHED
+declare -A SOCKET_MATCHED POOL_BINARY POOL_SEEN
+POOL_FILES=()
+
+# Pools included by the running FPM masters (covers custom paths, e.g. /opt builds)
+for conf in "${!MASTER_CONF_BIN[@]}"; do
+  [ -r "$conf" ] || continue
+  POOL_BINARY[$(readlink -f "$conf")]=${MASTER_CONF_BIN[$conf]}
+  POOL_FILES+=("$conf")
+  while read -r pattern; do
+    [ -n "$pattern" ] || continue
+    [[ $pattern == /* ]] || pattern="$(dirname "$(dirname "$conf")")/$pattern"
+    for pool_file in $pattern; do     # glob expansion is intended here
+      [ -f "$pool_file" ] || continue
+      POOL_BINARY[$(readlink -f "$pool_file")]=${MASTER_CONF_BIN[$conf]}
+      POOL_FILES+=("$pool_file")
+    done
+  done < <(awk '/^[ \t]*include[ \t]*=/ { v=substr($0, index($0, "=")+1); gsub(/^[ \t"]+|[ \t"]+$/, "", v); print v }' "$conf")
+done
+# Well-known locations (also catches pools of FPM versions that are not running)
+POOL_FILES+=(/etc/php/*/fpm/pool.d/*.conf /etc/php5/fpm/pool.d/*.conf /opt/*/etc/php-fpm.d/*.conf \
+             /etc/php-fpm.d/*.conf /etc/opt/remi/*/php-fpm.d/*.conf)
 
 fpm_binary_for_pool() {
   local f=$1 ver dir cand
@@ -471,6 +589,7 @@ parse_pool_file() {   # output: POOL\tname | LISTEN\tvalue | SET\tkey\tvalue\tad
 
 report_pool() {
   local pool_file=$1 fpm_bin=$2 pool_name=$3 listen=$4; shift 4
+  [ "$pool_name" = global ] && return 0
   local -A override=() override_kind=()
   local entry k v kind
   for entry in "$@"; do IFS=$'\t' read -r k v kind <<<"$entry"; override[$k]=$v; override_kind[$k]=$kind; done
@@ -483,8 +602,18 @@ report_pool() {
   vhosts=${SOCKET_VHOSTS[$norm]:-}
 
   printf '\n  %s[%s]%s %s\n' "$C_BOLD" "$pool_name" "$C_RESET" "$pool_file"
-  printf '          PHP %s %s | FPM: %s | listen: %s\n' "$version" "$(status_label "$status")" "$running" "$listen"
+  printf '          PHP %s %s | FPM: %s | listen: %s\n' "${version%%[-~+]*}" "$(status_label "$status")" "$running" "$listen"
   info "vhosts: ${vhosts:-(no vhost in the web server config points here)}"
+
+  if [ "$running" = "running" ] && [ -n "${RUNNING_START[$key]:-}" ]; then
+    if [ -n "$(changed_since "${RUNNING_START[$key]}" "$pool_file")" ]; then
+      warn "pool file changed after PHP-FPM started: the values below are NOT active until a reload"
+      COUNT_PENDING_CONFIG=$((COUNT_PENDING_CONFIG+1)); raise_exit 1
+    fi
+  elif [ "$running" != "running" ] && [ -n "$vhosts" ]; then
+    warn "vhosts point to this pool, but its PHP-FPM is not running (502 errors, or another FPM owns the socket?)"
+    COUNT_DOWN_POOLS=$((COUNT_DOWN_POOLS+1)); raise_exit 1
+  fi
 
   local upload upload_src mem mem_src mem_locked=0 post
   if [ "$status" = pre54 ]; then upload="n/a"; upload_src="-"
@@ -498,26 +627,41 @@ report_pool() {
   if [ -n "${override[post_max_size]+x}" ]; then post=${override[post_max_size]}
   else post=$(ini_of_binary "$key" post_max_size); post=${post:-8M}; fi
 
+  # Remember whether user-level overrides (.user.ini) could undo the mitigations
+  if [ "$status" != fixed ] && [ "$running" = "running" ]; then
+    [ "${override_kind[session.upload_progress.enabled]:-}" != admin ] || [ "$mem_locked" != 1 ] && USER_OVERRIDE_RISK=1
+  fi
+
   evaluate_settings "$status" "$upload" "$upload_src" "$mem" "$mem_locked" "$mem_src" "$post" pool
   [ "$status" != fixed ] && [ "$running" = "running" ] && [ -n "$vhosts" ] && raise_exit 2
 }
 
-if [ ${#POOL_FILES[@]} -eq 0 ]; then
-  info "No PHP-FPM pool configuration found."
-fi
+USER_OVERRIDE_RISK=0
+pool_count=0
 for pool_file in "${POOL_FILES[@]}"; do
-  fpm_bin=$(fpm_binary_for_pool "$pool_file"); [ -n "$fpm_bin" ] && probe_binary "$fpm_bin"
+  real_pool=$(readlink -f "$pool_file") || continue
+  [ -n "${POOL_SEEN[$real_pool]+x}" ] && continue
+  POOL_SEEN[$real_pool]=1
+  fpm_bin=${POOL_BINARY[$real_pool]:-$(fpm_binary_for_pool "$pool_file")}
+  [ -n "$fpm_bin" ] && probe_binary "$fpm_bin"
   current_pool=""; current_listen=""; pool_settings=()
   while IFS= read -r line; do
     case $line in
-      POOL$'\t'*)   [ -n "$current_pool" ] && report_pool "$pool_file" "$fpm_bin" "$current_pool" "$current_listen" ${pool_settings[@]+"${pool_settings[@]}"}
+      POOL$'\t'*)   if [ -n "$current_pool" ]; then
+                      report_pool "$pool_file" "$fpm_bin" "$current_pool" "$current_listen" ${pool_settings[@]+"${pool_settings[@]}"}
+                      [ "$current_pool" != global ] && pool_count=$((pool_count+1))
+                    fi
                     current_pool=${line#POOL$'\t'}; current_listen=""; pool_settings=() ;;
       LISTEN$'\t'*) current_listen=${line#LISTEN$'\t'} ;;
       SET$'\t'*)    pool_settings+=("${line#SET$'\t'}") ;;
     esac
   done < <(parse_pool_file "$pool_file")
-  [ -n "$current_pool" ] && report_pool "$pool_file" "$fpm_bin" "$current_pool" "$current_listen" ${pool_settings[@]+"${pool_settings[@]}"}
+  if [ -n "$current_pool" ]; then
+    report_pool "$pool_file" "$fpm_bin" "$current_pool" "$current_listen" ${pool_settings[@]+"${pool_settings[@]}"}
+    [ "$current_pool" != global ] && pool_count=$((pool_count+1))
+  fi
 done
+[ "$pool_count" = 0 ] && info "No PHP-FPM pool configuration found."
 
 unmatched=""
 for sock in "${!SOCKET_VHOSTS[@]}"; do
@@ -534,21 +678,24 @@ if [ "$MODPHP_LOADED" = 1 ]; then
   for key in "${!RUNNING_BIN[@]}"; do
     [[ $key == *.so ]] || continue
     status=${BIN_STATUS[$key]:-vuln}
-    printf '\n  %smod_php%s %s: PHP %s %s\n' "$C_BOLD" "$C_RESET" "$key" "${BIN_VERSION[$key]}" "$(status_label "$status")"
+    printf '\n  %smod_php%s %s: PHP %s %s\n' "$C_BOLD" "$C_RESET" "$key" "${BIN_VERSION[$key]%%[-~+]*}" "$(status_label "$status")"
     if [ "$status" != fixed ]; then
       bad "mod_php is loaded: PHP parses the multipart body before the application runs, on every vhost that serves .php via mod_php."
       module_name=$(basename "$key" .so); module_name=${module_name#lib}
       advise "If every site runs on PHP-FPM, disable it: a2dismod ${module_name}  (then restart Apache)"
+      USER_OVERRIDE_RISK=1
     fi
-    ini_files=(); IFS='|' read -ra ini_files <<<"${BIN_INI_FILES[$key]:-}"
-    upload=$(ini_get session.upload_progress.enabled ${ini_files[@]+"${ini_files[@]}"}); upload=${upload:-On}
-    mem=$(ini_get memory_limit ${ini_files[@]+"${ini_files[@]}"}); mem=${mem:-128M}
-    post=$(ini_get post_max_size ${ini_files[@]+"${ini_files[@]}"}); post=${post:-8M}
-    info "global (${ini_files[0]:-php.ini not found}):"
+    ini_files_of "$key"
+    upload=$(ini_get session.upload_progress.enabled ${INI_LIST[@]+"${INI_LIST[@]}"}); upload=${upload:-On}
+    mem=$(ini_get memory_limit ${INI_LIST[@]+"${INI_LIST[@]}"}); mem=${mem:-128M}
+    post=$(ini_get post_max_size ${INI_LIST[@]+"${INI_LIST[@]}"}); post=${post:-8M}
+    info "global (${INI_LIST[0]:-php.ini not found}):"
     [ "$status" = pre54 ] && upload="n/a"
     evaluate_settings "$status" "$upload" "php.ini" "$mem" 0 "php.ini" "$post" modphp
   done
   if [ ${#MODPHP_VHOSTS[@]} -gt 0 ]; then
+    apache_start=""
+    for key in "${!RUNNING_BIN[@]}"; do [[ $key == *.so ]] && apache_start=${RUNNING_START[$key]:-}; done
     info ""
     info "Apache vhosts without an FPM/FastCGI handler (they use mod_php, or have no PHP):"
     for entry in "${MODPHP_VHOSTS[@]}"; do
@@ -556,6 +703,10 @@ if [ "$MODPHP_LOADED" = 1 ]; then
       directives=$(grep -iE 'php_(admin_)?(value|flag)[[:space:]]+(session\.upload_progress\.enabled|memory_limit|post_max_size)' "$conf_file" \
            | sed -E 's/^[[:space:]]+//' | tr '\n' ';')
       info "  - $vhost  ${C_DIM}${directives:+[$directives]}${C_RESET}"
+      if [ -n "$apache_start" ] && [ -n "$(changed_since "$apache_start" "$conf_file")" ]; then
+        warn "    $conf_file changed after Apache started: NOT active until an Apache reload"
+        COUNT_PENDING_CONFIG=$((COUNT_PENDING_CONFIG+1)); raise_exit 1
+      fi
     done
   fi
 else
@@ -571,30 +722,63 @@ if [ ${#FCGID_ENTRIES[@]} -gt 0 ]; then
     if [ -z "$cgi_bin" ] || ! probe_binary "$cgi_bin"; then warn "$vhost: could not parse the starter script ($wrapper)"; continue; fi
     key=$(readlink -f "$cgi_bin"); status=${BIN_STATUS[$key]:-vuln}
     printf '\n  %s%s%s  starter: %s\n' "$C_BOLD" "$vhost" "$C_RESET" "$wrapper"
-    printf '          PHP %s %s (%s)\n' "${BIN_VERSION[$key]}" "$(status_label "$status")" "$key"
-    ini_files=(); IFS='|' read -ra ini_files <<<"${BIN_INI_FILES[$key]:-}"
-    [ -n "$phprc" ] && [ -r "${phprc%/}/php.ini" ] && ini_files[0]="${phprc%/}/php.ini"
-    upload=$(ini_get session.upload_progress.enabled ${ini_files[@]+"${ini_files[@]}"}); upload=${upload:-On}
-    mem=$(ini_get memory_limit ${ini_files[@]+"${ini_files[@]}"}); mem=${mem:-128M}
-    post=$(ini_get post_max_size ${ini_files[@]+"${ini_files[@]}"}); post=${post:-8M}
+    printf '          PHP %s %s (%s)\n' "${BIN_VERSION[$key]%%[-~+]*}" "$(status_label "$status")" "$key"
+    ini_files_of "$key"
+    [ -n "$phprc" ] && [ -r "${phprc%/}/php.ini" ] && INI_LIST[0]="${phprc%/}/php.ini"
+    upload=$(ini_get session.upload_progress.enabled ${INI_LIST[@]+"${INI_LIST[@]}"}); upload=${upload:-On}
+    mem=$(ini_get memory_limit ${INI_LIST[@]+"${INI_LIST[@]}"}); mem=${mem:-128M}
+    post=$(ini_get post_max_size ${INI_LIST[@]+"${INI_LIST[@]}"}); post=${post:-8M}
     [ "$status" = pre54 ] && upload="n/a"
-    info "php.ini: ${ini_files[0]:-?}"
+    info "php.ini: ${INI_LIST[0]:-?}"
     evaluate_settings "$status" "$upload" "php.ini" "$mem" 0 "php.ini" "$post" cgi
-    [ "$status" != fixed ] && raise_exit 2
+    if [ "$status" != fixed ]; then raise_exit 2; USER_OVERRIDE_RISK=1; fi
   done
 fi
 
 # =============================================================================
-header "6. Summary"
-if [ "$EXIT_CODE" = 0 ]; then
-  ok "Every PHP serving requests is patched, and no restart is pending."
+header "6. Per-directory overrides (.user.ini / .htaccess)"
+if [ "$USER_OVERRIDE_RISK" = 0 ]; then
+  info "Skipped: no vulnerable PHP serves requests without admin-locked mitigations."
 else
-  [ "$COUNT_VULN_RUNNING" -gt 0 ] && bad "Vulnerable RUNNING PHP processes: $COUNT_VULN_RUNNING"
-  [ "$COUNT_NEEDS_RESTART" -gt 0 ] && bad "Patched package, but restart pending: $COUNT_NEEDS_RESTART"
-  [ "$COUNT_VULN_INSTALLED" -gt 0 ] && warn "Vulnerable installed PHP binaries/modules in total: $COUNT_VULN_INSTALLED"
+  info "A vulnerable PHP serves requests and some settings are not admin-locked: these files can undo the mitigations."
+  override_files=0; override_shown=0
+  for root in /var/www /srv/www /home; do
+    [ -d "$root" ] || continue
+    while IFS= read -r -d '' file; do
+      case $file in
+        */.user.ini) match=$(grep -E '^[[:space:]]*(session\.upload_progress\.enabled|memory_limit)[[:space:]]*=' "$file" 2>/dev/null) ;;
+        *)           match=$(grep -E '^[[:space:]]*php_(admin_)?(value|flag)[[:space:]]+(session\.upload_progress\.enabled|memory_limit)' "$file" 2>/dev/null) ;;
+      esac
+      [ -n "$match" ] || continue
+      override_files=$((override_files+1))
+      if [ "$override_shown" -lt 25 ]; then
+        warn "$file: $(tr '\n' ';' <<<"$match" | sed -E 's/[[:space:]]+/ /g')"
+        override_shown=$((override_shown+1))
+      fi
+    done < <($TIMEOUT_CMD find "$root" -xdev -maxdepth 8 \( -name .user.ini -o -name .htaccess \) -type f -size -1024k -print0 2>/dev/null)
+  done
+  if [ "$override_files" = 0 ]; then
+    ok "No .user.ini / .htaccess overrides of session.upload_progress.enabled or memory_limit found."
+  else
+    [ "$override_files" -gt "$override_shown" ] && info "... and $((override_files-override_shown)) more file(s)."
+    advise "Use php_admin_flag / php_admin_value (pool or Apache config): those cannot be overridden per directory."
+    raise_exit 1
+  fi
 fi
 
-cat <<'EOF'
+# =============================================================================
+header "7. Summary"
+if [ "$EXIT_CODE" = 0 ]; then
+  ok "Every PHP serving requests is patched, no restart or reload is pending. Nothing to do."
+else
+  [ "$COUNT_VULN_RUNNING" -gt 0 ]   && bad  "Vulnerable or unverifiable RUNNING PHP processes: $COUNT_VULN_RUNNING"
+  [ "$COUNT_NEEDS_RESTART" -gt 0 ]  && bad  "Patched package, but restart pending: $COUNT_NEEDS_RESTART"
+  [ "$COUNT_STALE_OTHER" -gt 0 ]    && warn "Other processes still running a replaced PHP binary: $COUNT_STALE_OTHER"
+  [ "$COUNT_PENDING_CONFIG" -gt 0 ] && warn "Config changes waiting for a reload: $COUNT_PENDING_CONFIG"
+  [ "$COUNT_DOWN_POOLS" -gt 0 ]     && warn "Pools used by vhosts whose PHP-FPM is not running: $COUNT_DOWN_POOLS"
+  [ "$COUNT_VULN_INSTALLED" -gt 0 ] && warn "Vulnerable or unverifiable installed PHP binaries/modules in total: $COUNT_VULN_INSTALLED"
+
+  cat <<'EOF'
 
   Recommended order of actions:
    1. Update: 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12; for old branches (5.6-8.1) use a
@@ -602,6 +786,7 @@ cat <<'EOF'
       (not reload), or Apache when using mod_php. Run this script again.
    2. Where no fix is available yet: temporary settings (see above, per pool). Apply
       both, as each narrows a different CVE, and neither is a complete protection.
+      Reload the service afterwards, then re-run this script to confirm.
    3. ISPConfig: pool files are regenerated by ISPConfig, manual edits may be lost.
       - Per PHP version, in the FPM php.ini: session.upload_progress.enabled = 0
       - Per website: Website -> Options -> "Custom php.ini settings"
@@ -621,5 +806,6 @@ cat <<'EOF'
       (repeated 500 errors after multipart POSTs, unknown PHP files, new admin
       users, suspicious outbound connections).
 EOF
+fi
 
 exit "$EXIT_CODE"
