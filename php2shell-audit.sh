@@ -27,12 +27,24 @@
 # Older branches (5.6, 7.x, 8.0, 8.1) can only be fixed by a distribution /
 # sury.org backport: this is detected by looking for the CVE IDs in the
 # package changelog.
+#
+# Changelog:
+#   2.0.0 (2026-10-22)  Version number. Server-level php_admin_* in the Apache
+#                       config recognised for mod_php. Section 8: multipart
+#                       blocks (Apache/nginx), per-vhost access control
+#                       (password, IP, method limits, .htaccess), version
+#                       disclosure, fail2ban jails that ban on denied requests,
+#                       memory rlimits and cgroup limits. Section 9: signs of
+#                       compromise since --since. Less noise: unused pools on
+#                       one line, PHP under uploads/ grouped by directory.
+#   1.x                 Unnumbered versions (sections 1-7), 2026-10-21/22.
 # =============================================================================
 
 set -u
 export LC_ALL=C
 shopt -s nullglob
 
+SCRIPT_VERSION="2.0.0"
 CVE_RE='CVE-2026-109618|CVE-2026-109619'
 EXIT_CODE=0
 raise_exit() { [ "$1" -gt "$EXIT_CODE" ] && EXIT_CODE=$1; return 0; }
@@ -44,7 +56,8 @@ while [ $# -gt 0 ]; do
     --no-color) USE_COLOR=0 ;;
     --since)    shift; SINCE_ARG=${1:-} ;;
     --since=*)  SINCE_ARG=${1#--since=} ;;
-    -h|--help)  awk 'NR > 2 && /^#/ {sub(/^# ?/, ""); print; next} NR > 2 {exit}' "$0"; exit 0 ;;
+    -h|--help)  echo "php2shell-audit.sh $SCRIPT_VERSION"; awk 'NR > 2 && /^#/ {sub(/^# ?/, ""); print; next} NR > 2 {exit}' "$0"; exit 0 ;;
+    -V|--version) echo "$SCRIPT_VERSION"; exit 0 ;;
     *)          printf 'Unknown option: %s (see --help)\n' "$1" >&2; exit 64 ;;
   esac
   shift
@@ -398,50 +411,80 @@ apache_global_admin_settings() {
       if (n >= 3) { v = a[3]; gsub(/"/, "", v); print a[2] "\t" v } }' "${files[@]}" 2>/dev/null
 }
 
-# Multipart blocks, RLimitMEM and wrong Content-Type checks in the Apache config.
-# $@ = config files. Output (tab separated):
-#   VHOST  file  servername  blocked(0/1)  redirect_only(0/1)
+# A vhost file with its Include / IncludeOptional lines replaced by the included
+# files (one level; a directory includes every file in it).
+apache_expand_includes() {
+  local line pat inc root
+  root=$(apache_conf_root)
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ $line =~ ^[[:space:]]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee]([Oo][Pp][Tt][Ii][Oo][Nn][Aa][Ll])?[[:space:]]+\"?([^\"[:space:]]+) ]]; then
+      pat=${BASH_REMATCH[2]}
+      [[ $pat == /* ]] || pat="$root/$pat"
+      for inc in $pat; do   # glob expansion is intended here
+        if [ -d "$inc" ]; then cat "$inc"/* 2>/dev/null; elif [ -f "$inc" ]; then cat "$inc" 2>/dev/null; fi
+      done
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$1"
+}
+
+# Multipart blocks, access control, RLimitMEM and wrong Content-Type checks in the Apache config.
+# $1 = "server" (files scanned as they are) or "vhost" (Include lines expanded first), $2... = files.
+# Output (tab separated):
+#   VHOST  file  servername  blocked  redirect_only  auth  ip  method  documentroot   (flags 0/1)
 #   GLOBAL file  line                     <If> block outside any vhost/section: applies to every vhost
 #   SCOPED file  line  section            block outside vhosts but inside <Directory>/<Location>/...
 #   GLOBALRW file line                    mod_rewrite block outside vhosts: NOT inherited by vhosts
 #   WRONG  file  line                     %{CONTENT_TYPE} is the RESPONSE type: this does not block anything
 #   RLIMITMEM file line text
+# auth = AuthType + Require valid-user/user/group; ip = Require ip/host, Allow from <address>,
+# Deny from all; method = an <If> on REQUEST_METHOD / THE_REQUEST or a <LimitExcept> that denies.
+# Line numbers of vhost files count the expanded text.
 apache_multipart_scan() {
-  [ $# -gt 0 ] || return 0
-  awk '
+  local mode=$1 f; shift
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    if [ "$mode" = vhost ]; then apache_expand_includes "$f"; else cat "$f"; fi | awk -v F="$f" '
     function mark(kind) {
       if (invh) { vhblocked = 1; return }
-      if (kind == "rw") { print "GLOBALRW\t" FILENAME "\t" FNR; return }
-      if (sect != "") print "SCOPED\t" FILENAME "\t" ifline "\t" sect
-      else print "GLOBAL\t" FILENAME "\t" ifline
+      if (kind == "rw") { print "GLOBALRW\t" F "\t" NR; return }
+      if (sect != "") print "SCOPED\t" F "\t" ifline "\t" sect
+      else print "GLOBAL\t" F "\t" ifline
     }
     function flush_vh() {
-      if (invh) print "VHOST\t" FILENAME "\t" (vhname != "" ? vhname : "(no ServerName)") "\t" vhblocked "\t" (vhredirect && !vhdocroot ? 1 : 0)
+      if (invh) print "VHOST\t" F "\t" (vhname != "" ? vhname : "(no ServerName)") "\t" vhblocked "\t" \
+                      (vhredirall || (vhredirect && !vhdocroot) ? 1 : 0) "\t" (vhauthtype && vhrequser ? 1 : 0) "\t" vhip "\t" vhmethod "\t" vhroot
     }
-    FNR == 1 { invh = 0; ifd = 0; rwpend = 0; sect = ""; sectd = 0 }
+    BEGIN { invh = 0; ifd = 0; rwpend = 0; sect = ""; sectd = 0; limd = 0 }
     { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line); low = tolower(line) }
     line == "" || line ~ /^#/ { next }
-    low ~ /^<virtualhost[ \t>]/ { invh = 1; vhname = ""; vhblocked = 0; vhredirect = 0; vhdocroot = 0; next }
+    low ~ /^<virtualhost[ \t>]/ { invh = 1; vhname = ""; vhblocked = 0; vhredirect = 0; vhredirall = 0; vhdocroot = 0; rwhost = 0
+                                  vhauthtype = 0; vhrequser = 0; vhip = 0; vhmethod = 0; vhroot = ""; next }
     low ~ /^<\/virtualhost[ \t]*>/ { flush_vh(); invh = 0; next }
     low ~ /^<if[ \t]/ {
       ifd++
       if (ifd == 1) {
-        ifline = FNR; ifmp = (low ~ /multipart/); ifdeny = 0
+        ifline = NR; ifmp = (low ~ /multipart/); ifdeny = 0
         ifreq = (low ~ /req(_novary)?[ \t]*\(|http[ \t]*\(|%\{http:content-type\}/)
         ifwrong = (low ~ /%\{content_type\}/)
+        ifmeth = (low ~ /request_method|the_request/)
       }
       next
     }
     low ~ /^<\/if[ \t]*>/ {
       if (ifd == 1 && ifmp) {
-        if (ifwrong && !ifreq) print "WRONG\t" FILENAME "\t" ifline
+        if (ifwrong && !ifreq) print "WRONG\t" F "\t" ifline
         else if (ifreq && ifdeny) mark("if")
-      }
+      } else if (ifd == 1 && ifmeth && ifdeny && invh) vhmethod = 1
       if (ifd > 0) ifd--
       next
     }
     ifd >= 1 && (low ~ /^require[ \t]+all[ \t]+denied/ || low ~ /^deny[ \t]+from[ \t]+all/ || \
                  low ~ /^rewriterule[ \t].*\[([^]]*,)?(f|forbidden|g|gone|r=40[0-9])(,[^]]*)?\]/) { ifdeny = 1 }
+    invh && low ~ /^<limitexcept[ \t]/ { limd = 1; next }
+    invh && low ~ /^<\/limitexcept[ \t]*>/ { limd = 0; next }
+    invh && limd && (low ~ /^require[ \t]+all[ \t]+denied/ || low ~ /^deny[ \t]+from[ \t]+all/) { vhmethod = 1 }
     !invh && low ~ /^<(directory|directorymatch|location|locationmatch|files|filesmatch|proxy|proxymatch)[ \t>]/ {
       sectd++; if (sectd == 1) { sect = line; sub(/>.*/, ">", sect) }
       next
@@ -450,19 +493,39 @@ apache_multipart_scan() {
       if (sectd > 0) sectd--; if (sectd == 0) sect = ""
       next
     }
+    low ~ /^rewritecond[ \t]+%\{(http_host|server_name|request_uri|the_request|query_string)\}/ { rwhost = 1 }
     low ~ /^rewritecond[ \t]+%\{http:content-type\}[ \t].*multipart/ { rwpend = 1; next }
-    low ~ /^rewritecond[ \t]+%\{content_type\}[ \t].*multipart/ { print "WRONG\t" FILENAME "\t" FNR; next }
+    low ~ /^rewritecond[ \t]+%\{content_type\}[ \t].*multipart/ { print "WRONG\t" F "\t" NR; next }
     low ~ /^rewriterule[ \t]/ {
       if (rwpend && low ~ /\[([^]]*,)?(f|forbidden|g|gone|r=40[0-9])(,[^]]*)?\]/) mark("rw")
       rwpend = 0
       if (invh && low ~ /^rewriterule[ \t]+[^ \t]+[ \t]+https?:\/\// && low ~ /\[([^]]*,)?r(=[a-z0-9]+)?(,[^]]*)?\]/) vhredirect = 1
+      # a catch-all rule to an absolute URL (any flags) redirects every request, unless a condition narrows it
+      if (invh && !rwhost && low ~ /^rewriterule[ \t]+"?(\.|\^|\^\$|\(\.\*\)|\^\(\.\*\)\$|\^\/\(\.\*\)\$|\^\/\?\(\.\*\)\$)"?[ \t]+https?:\/\//) vhredirall = 1
+      rwhost = 0
     }
-    low ~ /^rlimitmem[ \t]/ { print "RLIMITMEM\t" FILENAME "\t" FNR "\t" line }
+    low ~ /^rlimitmem[ \t]/ { print "RLIMITMEM\t" F "\t" NR "\t" line }
+    invh && ifd == 0 && low ~ /^authtype[ \t]/ { vhauthtype = 1 }
+    invh && ifd == 0 && low ~ /^require[ \t]+(valid-user|user[ \t]|group[ \t])/ { vhrequser = 1 }
+    invh && low ~ /^require[ \t]+(ip|host|forward-dns)[ \t]/ { vhip = 1 }
+    invh && low ~ /^allow[ \t]+from[ \t]/ && low !~ /^allow[ \t]+from[ \t]+all/ { vhip = 1 }
+    invh && ifd == 0 && low ~ /^deny[ \t]+from[ \t]+all/ { vhip = 1 }
     invh && vhname == "" && low ~ /^servername[ \t]/ { split(line, a, /[ \t]+/); vhname = a[2] }
-    invh && low ~ /^documentroot[ \t]/ { vhdocroot = 1 }
-    invh && low ~ /^redirect(permanent)?[ \t]+((permanent|temp|seeother|30[1278])[ \t]+)?\/[ \t]+https?:\/\// { vhredirect = 1 }
+    invh && low ~ /^documentroot[ \t]/ { vhdocroot = 1; split(line, a, /[ \t]+/); vhroot = a[2]; gsub(/"/, "", vhroot) }
+    invh && low ~ /^redirect(permanent)?[ \t]+((permanent|temp|seeother|30[1278])[ \t]+)?\/[ \t]+https?:\/\// { vhredirect = 1; vhredirall = 1 }
     invh && low ~ /^redirectmatch[ \t]+((permanent|temp|30[1278])[ \t]+)?"?\^?\/?\(?\.\*\)?\$?"?[ \t]+https?:\/\// { vhredirect = 1 }
-  ' "$@" 2>/dev/null
+    ' 2>/dev/null
+  done
+}
+
+# Access control in the document root .htaccess: prints "auth", "ip" or nothing
+htaccess_access_control() {
+  local f="$1/.htaccess" c
+  [ -n "$1" ] && [ -r "$f" ] || return 0
+  c=$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null)
+  if grep -qiE '^[[:space:]]*(Require[[:space:]]+(ip|host)[[:space:]]|Allow[[:space:]]+from[[:space:]]+[0-9a-f:.]|Deny[[:space:]]+from[[:space:]]+all)' <<<"$c"; then echo ip
+  elif grep -qiE '^[[:space:]]*AuthType[[:space:]]' <<<"$c" && grep -qiE '^[[:space:]]*Require[[:space:]]+(valid-user|user|group)' <<<"$c"; then echo auth
+  fi
 }
 
 # Variables set by an nginx "map $http_content_type $var { ... multipart ... }" block
@@ -625,7 +688,7 @@ evaluate_settings() {
 }
 
 # =============================================================================
-printf '%sPHP2Shell audit (CVE-2026-109618 / CVE-2026-109619)%s\n' "$C_BOLD" "$C_RESET"
+printf '%sPHP2Shell audit %s (CVE-2026-109618 / CVE-2026-109619)%s\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET"
 printf 'Host: %s | Time: %s\n' "$(hostname -f 2>/dev/null || hostname)" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
 [ "$(id -u)" -eq 0 ] || warn "Not running as root: some configs and processes will not be visible."
 [ -r /etc/os-release ] && printf 'OS: %s\n' "$(. /etc/os-release; echo "${PRETTY_NAME:-?}")"
@@ -684,7 +747,7 @@ fi
 
 # =============================================================================
 header "3. Running PHP processes (what actually serves requests)"
-declare -A RUNNING_BIN RUNNING_START CHECKED_PIDS MASTER_CONF_BIN
+declare -A RUNNING_BIN=() RUNNING_START=() CHECKED_PIDS=() MASTER_CONF_BIN=()
 MODPHP_LOADED=0
 
 declare -A CONTAINER_REPORTED
@@ -970,6 +1033,11 @@ report_pool() {
     return 0
   fi
   printf '          PHP %s %s | FPM: %s | listen: %s\n' "${version%%[-~+]*}" "$(status_label "$status")" "$running" "$listen"
+  # A pool nothing runs and nothing points to serves no requests: one line instead of advice
+  if [ "$running" != "running" ] && [ -z "$vhosts" ]; then
+    info "${C_DIM}not running and no vhost points here: serves no requests (apply the mitigations before starting this FPM).${C_RESET}"
+    return 0
+  fi
   info "vhosts: ${vhosts:-(no vhost in the web server config points here)}"
 
   if [ "$running" = "running" ] && [ -n "${RUNNING_START[$key]:-}" ]; then
@@ -1270,7 +1338,7 @@ else
 fi
 
 # =============================================================================
-header "8. Web server: multipart blocking and memory limits"
+header "8. Web server: request filtering, access control and hardening"
 NEED_FILTER=0
 [ $((COUNT_VULN_RUNNING + COUNT_CONTAINER_VULN)) -gt 0 ] && NEED_FILTER=1
 if [ "$NEED_FILTER" = 1 ]; then
@@ -1288,9 +1356,11 @@ print_name_list() {   # stdin: names -> wrapped info lines
 # --- Apache ---
 if pgrep -x 'apache2|httpd' >/dev/null 2>&1; then
   printf '\n  %sApache%s\n' "$C_BOLD" "$C_RESET"
-  APACHE_FILES=()
-  while IFS= read -r f; do APACHE_FILES+=("$f"); done < <(apache_server_files; apache_vhost_files)
-  APACHE_SCAN=$(apache_multipart_scan ${APACHE_FILES[@]+"${APACHE_FILES[@]}"})
+  APACHE_SERVER_FILES=(); APACHE_VHOST_FILES=()
+  while IFS= read -r f; do APACHE_SERVER_FILES+=("$f"); done < <(apache_server_files)
+  while IFS= read -r f; do APACHE_VHOST_FILES+=("$f"); done < <(apache_vhost_files)
+  APACHE_SCAN=$(apache_multipart_scan server ${APACHE_SERVER_FILES[@]+"${APACHE_SERVER_FILES[@]}"}
+                apache_multipart_scan vhost ${APACHE_VHOST_FILES[@]+"${APACHE_VHOST_FILES[@]}"})
   apache_global=0
   while IFS=$'\t' read -r kind f1 f2 f3 f4; do
     case $kind in
@@ -1308,17 +1378,32 @@ if pgrep -x 'apache2|httpd' >/dev/null 2>&1; then
     esac
   done <<<"$APACHE_SCAN"
   vh_total=0; vh_blocked=0; vh_redirect=0; vh_open=""
-  while IFS=$'\t' read -r kind vh_file vh_name vh_is_blocked vh_is_redirect; do
+  declare -A VH_TAGS=() VH_PUBLIC=()
+  VH_ORDER=()
+  while IFS=$'\t' read -r kind vh_file vh_name vh_is_blocked vh_is_redirect vh_auth vh_ip vh_method vh_root; do
     [ "$kind" = VHOST ] || continue
     # does this vhost hand requests to PHP? (mod_php: every vhost; otherwise a FastCGI/proxy handler)
-    if [ "$MODPHP_LOADED" != 1 ] && ! grep -vE '^[[:space:]]*#' "$vh_file" 2>/dev/null \
+    if [ "$MODPHP_LOADED" != 1 ] && ! apache_expand_includes "$vh_file" 2>/dev/null | grep -vE '^[[:space:]]*#' \
          | grep -qiE 'proxy:(unix|fcgi)|fcgi://|FcgidWrapper|AddHandler[[:space:]].*php|SetHandler[[:space:]].*php'; then
       continue
     fi
     vh_total=$((vh_total+1))
-    if [ "$vh_is_redirect" = 1 ]; then vh_redirect=$((vh_redirect+1))
+    if [ "$vh_is_redirect" = 1 ]; then vh_redirect=$((vh_redirect+1)); continue
     elif [ "$vh_is_blocked" = 1 ] || [ "$apache_global" = 1 ]; then vh_blocked=$((vh_blocked+1))
     else vh_open+="$vh_name"$'\n'; fi
+    # access control in front of PHP (per name; a name is public if any of its blocks is)
+    tags=""
+    [ "$vh_auth" = 1 ] && tags+="password,"
+    [ "$vh_ip" = 1 ] && tags+="IP,"
+    [ "$vh_method" = 1 ] && tags+="method,"
+    ht=$(htaccess_access_control "${vh_root:-}"); [ -n "$ht" ] && tags+=".htaccess-$ht,"
+    # a document root without any PHP file (static site) does not run PHP at all
+    if [ -z "$tags" ] && [ -n "${vh_root:-}" ] && [ -d "$vh_root" ] \
+       && [ -z "$(find "$vh_root" -xdev -maxdepth 4 -type f -iname '*.php*' -print -quit 2>/dev/null)" ]; then
+      tags="no-PHP-files,"
+    fi
+    [ -n "${VH_TAGS[$vh_name]+x}" ] || VH_ORDER+=("$vh_name")
+    if [ -n "$tags" ]; then VH_TAGS[$vh_name]+="$tags"; else VH_TAGS[$vh_name]+=""; VH_PUBLIC[$vh_name]=1; fi
   done <<<"$APACHE_SCAN"
   vh_open_count=$(grep -c . <<<"$vh_open")
   info "<VirtualHost> blocks serving PHP: $vh_total | multipart blocked: $vh_blocked | redirect only: $vh_redirect | NOT blocked: $vh_open_count"
@@ -1337,6 +1422,40 @@ if pgrep -x 'apache2|httpd' >/dev/null 2>&1; then
       info "    </If>"
     fi
   fi
+  # Access control in front of PHP: only meaningful while a vulnerable PHP serves requests
+  if [ "$NEED_FILTER" = 1 ] && [ ${#VH_ORDER[@]} -gt 0 ]; then
+    protected_list=""; public_list=""
+    for n in "${VH_ORDER[@]}"; do
+      if [ -n "${VH_PUBLIC[$n]+x}" ]; then public_list+="$n"$'\n'
+      else t=${VH_TAGS[$n]%,}; t=$(tr ',' '\n' <<<"$t" | sort -u | tr '\n' ',' ); protected_list+="$n[${t%,}]"$'\n'; fi
+    done
+    printf '\n'
+    info "Access control in front of PHP (checked in the vhost config and the document root .htaccess; check the scope by hand):"
+    if [ -n "$protected_list" ]; then
+      ok "$(grep -c . <<<"$protected_list") vhost name(s) behind a password, an IP list or a method limit, or without PHP files:"
+      print_name_list <<<"$protected_list"
+    fi
+    if [ -n "$public_list" ]; then
+      info "$(grep -c . <<<"$public_list") vhost name(s) serve the vulnerable PHP to anyone (only the multipart block and the PHP settings protect them):"
+      print_name_list <<<"$public_list"
+      advise "Admin tools, webmail, rarely used sites: an Apache-level password and/or IP list for the whole vhost"
+      info "    (<Location \"/\"> AuthType Basic ... <RequireAll> Require valid-user + Require ip ... </RequireAll>), or allow"
+      info "    only GET/HEAD; unused sites: disable them (a name pointing elsewhere is still reachable via the Host header)."
+    fi
+  fi
+
+  # Version disclosure in the Server header and on error pages
+  st=$(awk 'tolower($1) == "servertokens" {v = $2} END {print v}' ${APACHE_SERVER_FILES[@]+"${APACHE_SERVER_FILES[@]}"} 2>/dev/null)
+  sg=$(awk 'tolower($1) == "serversignature" {v = $2} END {print v}' ${APACHE_SERVER_FILES[@]+"${APACHE_SERVER_FILES[@]}"} 2>/dev/null)
+  case ${st,,} in
+    prod|productonly) ok "ServerTokens $st: the Server header does not show the version" ;;
+    *) info "ServerTokens ${st:-Full (default)}: the Server header shows the Apache version and OS, which helps scanners pick targets"
+       advise "ServerTokens Prod   (conf-available/security.conf on Debian)" ;;
+  esac
+  case ${sg,,} in
+    off) : ;;
+    *) info "ServerSignature ${sg:-On (default)}: error pages show the version"; advise "ServerSignature Off" ;;
+  esac
 fi
 
 # --- nginx ---
@@ -1380,6 +1499,49 @@ fi
 if [ "$NEED_FILTER" = 1 ] && [ "$((COUNT_NO_MULTIPART_BLOCK + COUNT_WRONG_BLOCK))" -lt 1 ] \
    && { pgrep -x 'apache2|httpd' >/dev/null 2>&1 || pgrep -x nginx >/dev/null 2>&1; }; then
   info "Verify from ANOTHER host (also directly on the IP): curl -sS -o /dev/null -w '%{http_code}\\n' -F t=1 --resolve NAME:443:IP https://NAME/  -> 403"
+fi
+
+# --- nginx version disclosure ---
+if pgrep -x nginx >/dev/null 2>&1; then
+  if sed -E 's/#.*//' ${NGINX_FILES[@]+"${NGINX_FILES[@]}"} 2>/dev/null | grep -qE '(^|[[:space:];{])server_tokens[[:space:]]+off'; then
+    ok "nginx server_tokens off: the Server header does not show the version"
+  else
+    info "nginx server_tokens is on (default): the Server header and error pages show the nginx version"
+    advise "server_tokens off;   (http {} context)"
+  fi
+fi
+
+# --- expose_php of the PHP binaries serving requests ---
+exposed=""
+for key in "${!RUNNING_BIN[@]}"; do
+  ini_files_of "$key"
+  v=$(ini_get expose_php ${INI_LIST[@]+"${INI_LIST[@]}"}); v=${v:-On}
+  is_on "$v" && exposed+="${key##*/} "
+done
+if [ -n "$exposed" ]; then
+  info "expose_php = On for: $exposed(the X-Powered-By header shows the PHP version)"
+  advise "expose_php = Off   (in the php.ini of these PHP versions)"
+elif [ -n "${!RUNNING_BIN[*]}" ]; then
+  ok "expose_php is off for every PHP serving requests"
+fi
+
+# --- fail2ban jails that ban on denied requests ---
+if command -v fail2ban-client >/dev/null 2>&1 && $TIMEOUT_CMD fail2ban-client ping >/dev/null 2>&1; then
+  f2b_hits=""
+  for jail in $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' ' '); do
+    if $TIMEOUT_CMD fail2ban-client get "$jail" failregex 2>/dev/null | grep -q 'denied by server configuration'; then
+      lp=$($TIMEOUT_CMD fail2ban-client get "$jail" logpath 2>/dev/null | grep -oE '/[^ ]+' | tr '\n' ' ')
+      f2b_hits+="$jail ($lp)"$'\n'
+    fi
+  done
+  if [ -n "$f2b_hits" ]; then
+    info "fail2ban jails that count Apache 'client denied' (AH01630) lines as failures:"
+    while IFS= read -r l; do [ -n "$l" ] && info "  $l"; done <<<"$f2b_hits"
+    info "A request rejected by the multipart block (or by an IP list) writes such a line: users and your own tests can be banned."
+    advise "In the vhosts these jails watch, reject multipart with a vhost-level RewriteRule (no AH01630 line):"
+    info "    RewriteEngine On / RewriteCond %{HTTP:Content-Type} multipart [NC] / RewriteRule ^ - [F]"
+    info "    and test those vhosts only from an ignoreip address (e.g. 127.0.0.1)."
+  fi
 fi
 
 # --- memory limits of the processes serving PHP ---
@@ -1523,8 +1685,11 @@ else
                if [ "$(stat -c %s "$p" 2>/dev/null || echo 0)" -lt 200 ] && grep -qi 'silence is golden' "$p" 2>/dev/null; then continue; fi
                echo "$t  $u  $p"; done)
   if [ -n "$upl_real" ]; then
-    check "PHP file(s) under an uploads/ directory (uploads should never contain PHP):"
-    show_limited 25 info <<<"$upl_real"
+    # grouped by directory: count, newest date, owner (a theme or plugin cache shows up as one line)
+    check "PHP file(s) under an uploads/ directory (uploads should never contain PHP; caches of themes/plugins are a common harmless case):"
+    awk '{ d = $4; sub(/\/[^\/]*$/, "", d); n[d]++; if ($1 " " $2 > newest[d]) newest[d] = $1 " " $2; owner[d] = $3 }
+         END { for (d in n) printf "%s  %4d file(s), newest %s, owner %s\n", d, n[d], newest[d], owner[d] }' <<<"$upl_real" \
+      | sort | show_limited 20 info
   fi
   # handlers and auto_prepend in .htaccess / .user.ini (any age)
   cfg_hits=$(awk -F'\t' '$1 == "CFG" {print $4}' <<<"$FIND_OUT" | while IFS= read -r p; do
