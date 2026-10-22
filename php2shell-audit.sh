@@ -335,6 +335,32 @@ ini_of_binary() {  # $1 binary key, $2 ini key -> value (or empty)
   ini_get "$2" ${INI_LIST[@]+"${INI_LIST[@]}"}
 }
 
+# Server-level php_admin_value / php_admin_flag in the Apache config (outside <VirtualHost>,
+# <Directory>, <Location>, <Files>...). They apply to every mod_php vhost and win over
+# php_value in vhosts and .htaccess. Output: "key<TAB>value" lines.
+# APACHE_CONF_ROOT can point the function to another directory (for testing).
+apache_global_admin_settings() {
+  local root files=() f
+  if [ -n "${APACHE_CONF_ROOT:-}" ]; then root=$APACHE_CONF_ROOT
+  elif [ -d /etc/apache2 ]; then root=/etc/apache2
+  elif [ -d /etc/httpd ]; then root=/etc/httpd
+  else return 0; fi
+  for f in "$root/apache2.conf" "$root/conf/httpd.conf" "$root"/conf-enabled/*.conf \
+           "$root"/mods-enabled/*.conf "$root"/conf.modules.d/*.conf; do
+    [ -f "$f" ] && files+=("$f")
+  done
+  [ ${#files[@]} -gt 0 ] || return 0
+  awk '
+    FNR == 1 { depth = 0 }
+    { line=$0; sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line); low=tolower(line) }
+    line == "" || line ~ /^#/ { next }
+    low ~ /^<(virtualhost|directory|directorymatch|location|locationmatch|files|filesmatch|proxy|proxymatch)([ \t>]|$)/ { depth++; next }
+    low ~ /^<\/(virtualhost|directory|directorymatch|location|locationmatch|files|filesmatch|proxy|proxymatch)[ \t]*>/ { if (depth > 0) depth--; next }
+    depth == 0 && low ~ /^php_admin_(value|flag)[ \t]/ {
+      n = split(line, a, /[ \t]+/)
+      if (n >= 3) { v = a[3]; gsub(/"/, "", v); print a[2] "\t" v } }' "${files[@]}" 2>/dev/null
+}
+
 # -----------------------------------------------------------------------------
 # Evaluation + recommendations
 #   evaluate_settings <status> <upload_progress> <upload_progress_source> <memory_limit>
@@ -860,6 +886,10 @@ done
 # =============================================================================
 header "5. Other PHP handlers: mod_php and FastCGI/fcgid"
 if [ "$MODPHP_LOADED" = 1 ]; then
+  declare -A APACHE_ADMIN=()
+  while IFS=$'\t' read -r admin_key admin_value; do
+    [ -n "$admin_key" ] && APACHE_ADMIN[$admin_key]=$admin_value
+  done < <(apache_global_admin_settings)
   for key in "${!RUNNING_BIN[@]}"; do
     [[ $key == *.so ]] || continue
     status=${BIN_STATUS[$key]:-vuln}
@@ -868,15 +898,29 @@ if [ "$MODPHP_LOADED" = 1 ]; then
       bad "mod_php is loaded: PHP parses the multipart body before the application runs, on every vhost that serves .php via mod_php."
       module_name=$(basename "$key" .so); module_name=${module_name#lib}
       advise "If every site runs on PHP-FPM, disable it: a2dismod ${module_name}  (then restart Apache)"
-      USER_OVERRIDE_RISK=1
     fi
     ini_files_of "$key"
-    upload=$(ini_get session.upload_progress.enabled ${INI_LIST[@]+"${INI_LIST[@]}"}); upload=${upload:-On}
-    mem=$(ini_get memory_limit ${INI_LIST[@]+"${INI_LIST[@]}"}); mem=${mem:-128M}
+    upload=$(ini_get session.upload_progress.enabled ${INI_LIST[@]+"${INI_LIST[@]}"}); upload=${upload:-On}; upload_src="php.ini"
+    mem=$(ini_get memory_limit ${INI_LIST[@]+"${INI_LIST[@]}"}); mem=${mem:-128M}; mem_src="php.ini"; mem_locked=0
     post=$(ini_get post_max_size ${INI_LIST[@]+"${INI_LIST[@]}"}); post=${post:-8M}
-    info "global (${INI_LIST[0]:-php.ini not found}):"
+    # Server-level php_admin_* in the Apache config wins over php.ini, vhosts and .htaccess
+    upload_locked=0
+    if [ -n "${APACHE_ADMIN[session.upload_progress.enabled]+x}" ]; then
+      upload=${APACHE_ADMIN[session.upload_progress.enabled]}; upload_src="Apache config, admin"; upload_locked=1
+    fi
+    if [ -n "${APACHE_ADMIN[memory_limit]+x}" ]; then
+      mem=${APACHE_ADMIN[memory_limit]}; mem_src="Apache config, admin"; mem_locked=1
+    fi
+    [ -n "${APACHE_ADMIN[post_max_size]+x}" ] && post=${APACHE_ADMIN[post_max_size]}
+    # Without admin locks, .htaccess files could undo the mitigations (checked in section 7)
+    if [ "$status" != fixed ] && { [ "$upload_locked" = 0 ] || [ "$mem_locked" = 0 ]; }; then USER_OVERRIDE_RISK=1; fi
+    if [ ${#APACHE_ADMIN[@]} -gt 0 ]; then
+      info "global (${INI_LIST[0]:-php.ini not found} + server-level php_admin_* in the Apache config):"
+    else
+      info "global (${INI_LIST[0]:-php.ini not found}):"
+    fi
     [ "$status" = pre54 ] && upload="n/a"
-    evaluate_settings "$status" "$upload" "php.ini" "$mem" 0 "php.ini" "$post" modphp
+    evaluate_settings "$status" "$upload" "$upload_src" "$mem" "$mem_locked" "$mem_src" "$post" modphp
   done
   if [ ${#MODPHP_VHOSTS[@]} -gt 0 ]; then
     apache_start=""
@@ -885,14 +929,31 @@ if [ "$MODPHP_LOADED" = 1 ]; then
     info "Apache vhosts without an FPM/FastCGI handler (they use mod_php, or have no PHP):"
     for entry in "${MODPHP_VHOSTS[@]}"; do
       vhost=${entry%%|*}; conf_file=${entry#*|}
-      directives=$(grep -iE 'php_(admin_)?(value|flag)[[:space:]]+(session\.upload_progress\.enabled|memory_limit|post_max_size)' "$conf_file" \
-           | sed -E 's/^[[:space:]]+//' | tr '\n' ';')
+      directives=$(grep -vE '^[[:space:]]*#' "$conf_file" \
+           | grep -iE '^[[:space:]]*php_(admin_)?(value|flag)[[:space:]]+(session\.upload_progress\.enabled|memory_limit|post_max_size)[[:space:]]' \
+           | sed -E 's/^[[:space:]]+//; s/[[:space:]]+/ /g' | sort -u | tr '\n' ';')
       info "  - $vhost  ${C_DIM}${directives:+[$directives]}${C_RESET}"
+      # A vhost-level php_admin_* is stronger than the server-level one: it can undo the mitigation
+      if [ "$status" != fixed ]; then
+        while read -r undo_key undo_value; do
+          case $undo_key in
+            memory_limit) [ "$undo_value" = "-1" ] && continue ;;
+            session.upload_progress.enabled) is_on "$undo_value" || continue ;;
+          esac
+          warn "    vhost-level php_admin_* overrides the mitigation here: $undo_key = $undo_value"
+          USER_OVERRIDE_RISK=1; raise_exit 1
+        done < <(grep -vE '^[[:space:]]*#' "$conf_file" \
+                 | grep -ioE '^[[:space:]]*php_admin_(value|flag)[[:space:]]+(session\.upload_progress\.enabled|memory_limit)[[:space:]]+[^[:space:]]+' \
+                 | awk '{gsub(/"/, "", $3); print $2, $3}' | sort -u)
+      fi
       if [ -n "$apache_start" ] && [ -n "$(changed_since "$apache_start" "$conf_file")" ]; then
         warn "    $conf_file changed after Apache started: NOT active until an Apache reload"
         COUNT_PENDING_CONFIG=$((COUNT_PENDING_CONFIG+1)); raise_exit 1
       fi
     done
+    admin_keys=""
+    for admin_key in "${!APACHE_ADMIN[@]}"; do admin_keys+="${admin_keys:+, }$admin_key"; done
+    [ -n "$admin_keys" ] && info "${C_DIM}(server-level php_admin_* for $admin_keys wins over the vhosts' php_value lines; a vhost-level php_admin_* would win over it)${C_RESET}"
   fi
 else
   info "mod_php is not loaded in a running Apache (or Apache is not running)."
