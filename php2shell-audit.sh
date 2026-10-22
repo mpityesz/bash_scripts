@@ -29,6 +29,10 @@
 # package changelog.
 #
 # Changelog:
+#   2.0.2 (2026-10-22)  nginx: access tags only count directives at server
+#                       level, in "location /" and in PHP locations, so the
+#                       ISPConfig dotfile "deny all" and the /stats/ auth no
+#                       longer mark every site as protected.
 #   2.0.1 (2026-10-22)  nginx: access control per server block (auth_basic,
 #                       deny all, limit_except) and the ISPConfig hint for the
 #                       multipart block. Generic system directories (e.g. a
@@ -51,7 +55,7 @@ set -u
 export LC_ALL=C
 shopt -s nullglob
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 CVE_RE='CVE-2026-109618|CVE-2026-109619'
 EXIT_CODE=0
 raise_exit() { [ "$1" -gt "$EXIT_CODE" ] && EXIT_CODE=$1; return 0; }
@@ -580,6 +584,32 @@ nginx_text_blocks_multipart() {   # $1 text, $2 space separated map variables
       if (hit) { if (low ~ /return[ \t]+(40[0-9]|41[0-9]|444)/) found = 1; else pending = 3 }
     }
     END { exit found ? 0 : 1 }' <<<"$1"
+}
+
+# Access control in front of PHP in one nginx server block: prints "password", "IP", "method"
+# (space separated). Only directives at server level, in "location /" or in a PHP location
+# count: ISPConfig puts "deny all" on dot files and auth_basic on /stats into every vhost.
+nginx_block_access_flags() {   # $1 server block text (comments stripped)
+  sed -E 's/[{;}]/&\n/g' <<<"$1" | awk '
+    { l = $0; sub(/^[ \t]+/, "", l); sub(/[ \t]+$/, "", l) }
+    l == "" { next }
+    l ~ /\{$/ {
+      d++
+      if (d == 1) { st[d] = 1; next }                       # the server block itself
+      if (l ~ /^location[ \t]/) {
+        pat = l; sub(/^location[ \t]+/, "", pat); sub(/[ \t]*\{$/, "", pat)
+        flag = (pat ~ /^(=[ \t]*)?\/$/ || pat ~ /\\\.php/ || pat ~ /\.php/) ? 1 : 0
+        st[d] = (flag || (d > 2 && st[d-1])) ? 1 : 0
+      } else {
+        st[d] = st[d-1]
+        if (st[d-1] && (l ~ /^limit_except[ \t]/ || l ~ /^if[ \t]*\([ \t]*\$request_method/)) m = 1
+      }
+      next
+    }
+    l ~ /^\}$/ { if (d > 0) d--; next }
+    st[d] && l ~ /^auth_basic[ \t]/ && l !~ /^auth_basic[ \t]+off[ \t]*;/ { a = 1 }
+    st[d] && l ~ /^deny[ \t]+all[ \t]*;/ { i = 1 }
+    END { if (a) printf "password "; if (i) printf "IP "; if (m) printf "method " }'
 }
 
 # Soft RLIMIT_AS / RLIMIT_DATA of a process ("" if unlimited or unknown)
@@ -1498,11 +1528,9 @@ if pgrep -x nginx >/dev/null 2>&1; then
     sb_name=${sb_name:-$(basename "$sb_file"):$sb_line}
     if nginx_text_blocks_multipart "$sb_full" "$MP_VARS"; then sb_blocked=$((sb_blocked+1))
     else sb_open+="$sb_name"$'\n'; fi
-    # access control in front of PHP (anywhere in the block: check the scope by hand)
+    # access control in front of PHP (server level, "location /" or a PHP location)
     tags=""
-    grep -E '(^|[[:space:];{])auth_basic[[:space:]]+' <<<"$sb_full" | grep -qvE 'auth_basic[[:space:]]+off[[:space:]]*;' && tags+="password,"
-    grep -qE '(^|[[:space:];{])deny[[:space:]]+all[[:space:]]*;' <<<"$sb_full" && tags+="IP,"
-    grep -qE '(^|[[:space:];{])limit_except[[:space:]]|if[[:space:]]*\([[:space:]]*\$request_method' <<<"$sb_full" && tags+="method,"
+    for t in $(nginx_block_access_flags "$sb_text"); do tags+="$t,"; done
     [ -n "${NG_TAGS[$sb_name]+x}" ] || NG_ORDER+=("$sb_name")
     if [ -n "$tags" ]; then NG_TAGS[$sb_name]+="$tags"; else NG_TAGS[$sb_name]+=""; NG_PUBLIC[$sb_name]=1; fi
   done < <(nginx_server_blocks ${NGINX_VHOST_FILES[@]+"${NGINX_VHOST_FILES[@]}"})
