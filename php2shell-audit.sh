@@ -600,6 +600,28 @@ add_socket() {
   [[ " ${SOCKET_VHOSTS[$k]:-} " == *" $2 "* ]] || SOCKET_VHOSTS[$k]+="${SOCKET_VHOSTS[$k]:+ }$2"
 }
 
+# All config files nginx actually loads (nginx -T follows every include); fallback: usual paths
+NGINX_FILES=()
+if command -v nginx >/dev/null 2>&1; then
+  while IFS= read -r f; do [ -f "$f" ] && NGINX_FILES+=("$f"); done < <(
+    $TIMEOUT_CMD nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p' | sort -u)
+fi
+[ ${#NGINX_FILES[@]} -gt 0 ] || NGINX_FILES=(/etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*)
+
+# Files included by an nginx config file (active "include" directives only, 2 levels deep)
+nginx_includes() {   # $1 file, $2 depth
+  local file=$1 depth=${2:-0} pattern inc
+  [ "$depth" -lt 2 ] || return 0
+  while read -r pattern; do
+    [ -n "$pattern" ] || continue
+    [[ $pattern == /* ]] || pattern="/etc/nginx/$pattern"
+    for inc in $pattern; do   # glob expansion is intended here
+      [ -f "$inc" ] || continue
+      echo "$inc"; nginx_includes "$inc" $((depth+1))
+    done
+  done < <(sed -E 's/#.*//' "$file" | grep -oE '(^|[[:space:];{])include[[:space:]]+[^;]+' | sed -E 's/^.*include[[:space:]]+//')
+}
+
 # nginx upstream blocks: name -> server addresses (e.g. "php-handler" -> 127.0.0.1:9000)
 declare -A NGINX_UPSTREAM
 while IFS=$'\t' read -r up_name up_server; do
@@ -611,7 +633,7 @@ done < <(awk '
          while (match(rest, /(^|[ \t;{])server[ \t]+[^; \t]+/)) {
            s=substr(rest, RSTART, RLENGTH); sub(/^.*server[ \t]+/, "", s); print name "\t" s
            rest=substr(rest, RSTART+RLENGTH) } }
-  inup && line ~ /\}/ { inup=0 }' /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null)
+  inup && line ~ /\}/ { inup=0 }' "${NGINX_FILES[@]}" 2>/dev/null)
 
 for conf_file in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
   [ -f "$conf_file" ] || continue
@@ -625,7 +647,10 @@ for conf_file in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
       add_socket "$sock" "$vhost"
     fi
   done < <(
-    grep -E '^[^#]*fastcgi_pass' "$conf_file" | grep -oE 'fastcgi_pass[[:space:]]+[^;]+' | sed -E 's/fastcgi_pass[[:space:]]+//' | sort -u)
+    # the vhost file and the files it includes; comments are stripped before matching
+    { cat "$conf_file"; nginx_includes "$conf_file" | sort -u | while read -r inc; do cat "$inc"; done; } \
+      | sed -E 's/#.*//' | grep -oE '(^|[[:space:];{])fastcgi_pass[[:space:]]+[^;]+' \
+      | sed -E 's/^.*fastcgi_pass[[:space:]]+//' | sort -u)
 done
 
 for conf_file in /etc/apache2/sites-enabled/* /etc/httpd/conf.d/*.conf /etc/httpd/sites-enabled/*; do
