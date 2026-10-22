@@ -49,6 +49,7 @@ command -v dpkg-query >/dev/null 2>&1 && HAVE_DPKG=1
 
 COUNT_VULN_RUNNING=0; COUNT_NEEDS_RESTART=0; COUNT_VULN_INSTALLED=0
 COUNT_STALE_OTHER=0; COUNT_PENDING_CONFIG=0; COUNT_DOWN_POOLS=0
+COUNT_CONTAINER_VULN=0; COUNT_EXPOSED_FASTCGI=0; COUNT_EXPOSED_DB=0; COUNT_UNMATCHED=0
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -146,6 +147,38 @@ process_start_time() {   # process start time (epoch seconds)
 }
 
 parent_pid() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $2}'; }
+
+HAVE_DOCKER=0
+command -v docker >/dev/null 2>&1 && $TIMEOUT_CMD docker info >/dev/null 2>&1 && HAVE_DOCKER=1
+declare -A CONTAINER_NAME_CACHE
+
+container_of_pid() {   # prints the container name (or short id) a process runs in; empty on the host
+  local id name=""
+  id=$(grep -oE '[0-9a-f]{64}' "/proc/$1/cgroup" 2>/dev/null | head -n1)
+  [ -n "$id" ] || return 0
+  if [ -z "${CONTAINER_NAME_CACHE[$id]+x}" ]; then
+    [ "$HAVE_DOCKER" = 1 ] && name=$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null)
+    name=${name#/}
+    CONTAINER_NAME_CACHE[$id]=${name:-${id:0:12}}
+  fi
+  echo "${CONTAINER_NAME_CACHE[$id]}"
+}
+
+container_php_version() {   # $1 container, $2 optional binary path inside it -> PHP version or empty
+  local bin out
+  [ "$HAVE_DOCKER" = 1 ] || return 0
+  for bin in ${2:+"$2"} php php-cgi php-fpm; do
+    out=$($TIMEOUT_CMD docker exec "$1" "$bin" -v 2>/dev/null | head -n1)
+    if [[ $out == "PHP "* ]]; then sed -n 's/^PHP \([0-9][^ ]*\) .*/\1/p' <<<"$out"; return 0; fi
+  done
+}
+
+container_php_status() {   # $1 version (may be empty) -> fixed | pre54 | vuln | unverified
+  local st
+  [ -n "$1" ] || { echo unverified; return; }
+  st=$(upstream_status "$1")
+  case $st in fixed|pre54) echo "$st" ;; *) echo vuln ;; esac
+}
 
 # Prints the files (from $2...) modified after the epoch time in $1
 changed_since() {
@@ -405,10 +438,30 @@ header "3. Running PHP processes (what actually serves requests)"
 declare -A RUNNING_BIN RUNNING_START CHECKED_PIDS MASTER_CONF_BIN
 MODPHP_LOADED=0
 
+declare -A CONTAINER_REPORTED
+# A PHP process inside a container: its binary lives in the image, not on the host
+report_container_process() {   # $1 pid, $2 description, $3 container, $4 binary path inside the container
+  local pid=$1 desc=$2 cname=$3 exe=$4 version status image=""
+  [ -n "${CONTAINER_REPORTED[$cname]+x}" ] && return 0
+  CONTAINER_REPORTED[$cname]=1
+  version=$(container_php_version "$cname" "$exe")
+  status=$(container_php_status "$version")
+  [ "$HAVE_DOCKER" = 1 ] && image=$(docker inspect -f '{{.Config.Image}}' "$cname" 2>/dev/null)
+  if [ "$status" = fixed ]; then
+    ok "$desc in container $cname${image:+ [$image]} (PID $pid): $version $(status_label fixed)"
+  else
+    bad "$desc in container $cname${image:+ [$image]} (PID $pid): ${version:-unknown} $(status_label "$status")"
+    advise "Update the container image (see section 6); host package updates do not reach it."
+    COUNT_CONTAINER_VULN=$((COUNT_CONTAINER_VULN+1)); raise_exit 2
+  fi
+}
+
 # $1 pid, $2 description, $3 binary/module path (may end in "(deleted)"), $4.. extra config files
 check_running() {
-  local pid=$1 desc=$2 path=$3 clean_path deleted=0 start mtime key; shift 3
+  local pid=$1 desc=$2 path=$3 clean_path deleted=0 start mtime key cname; shift 3
   CHECKED_PIDS[$pid]=1
+  cname=$(container_of_pid "$pid")
+  if [ -n "$cname" ]; then report_container_process "$pid" "$desc" "$cname" "${path% (deleted)}"; return 0; fi
   clean_path=${path% (deleted)}; [ "$clean_path" != "$path" ] && deleted=1
   key=$(readlink -f "$clean_path" 2>/dev/null || echo "$clean_path")
   if [[ $key == *.so ]]; then probe_module "$key"; else probe_binary "$key" || true; fi
@@ -443,10 +496,13 @@ check_running() {
 }
 
 found_any=0
-for pid in $(pgrep -f 'php-fpm: master process' 2>/dev/null); do
+for pid in $(pgrep -f '^php-fpm: master process' 2>/dev/null); do
   exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+  case ${exe##*/} in *php*) ;; *) continue ;; esac
   conf=$(tr '\0' ' ' <"/proc/$pid/cmdline" | sed -n 's/.*(\(.*\)).*/\1/p')
-  if [ -n "$conf" ]; then
+  if [ -n "$(container_of_pid "$pid")" ]; then
+    check_running "$pid" "PHP-FPM master" "$exe"
+  elif [ -n "$conf" ]; then
     MASTER_CONF_BIN[$conf]=$(readlink -f "${exe% (deleted)}" 2>/dev/null || echo "${exe% (deleted)}")
     check_running "$pid" "PHP-FPM master [$conf]" "$exe" "$conf"
   else
@@ -463,9 +519,11 @@ for pid in $(pgrep -o -x 'apache2|httpd' 2>/dev/null); do
 done
 declare -A CGI_SEEN
 for pid in $(pgrep -f 'php-cgi|php[0-9.]*-cgi' 2>/dev/null); do
-  CHECKED_PIDS[$pid]=1
   exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
-  [ -n "${CGI_SEEN[$exe]+x}" ] && continue; CGI_SEEN[$exe]=1
+  case ${exe##*/} in *php*cgi*) ;; *) continue ;; esac   # not e.g. a grep for php-cgi
+  CHECKED_PIDS[$pid]=1
+  cgi_key="$(container_of_pid "$pid")|$exe"
+  [ -n "${CGI_SEEN[$cgi_key]+x}" ] && continue; CGI_SEEN[$cgi_key]=1
   check_running "$pid" "php-cgi (FastCGI/fcgid)" "$exe"; found_any=1
 done
 pgrep -x nginx >/dev/null 2>&1 && info "Nginx is running"
@@ -488,6 +546,7 @@ for proc_dir in /proc/[0-9]*; do
     stale=$(awk '$6 ~ /php/ && $NF == "(deleted)" {print $6; exit}' "$proc_dir/maps" 2>/dev/null)
   fi
   [ -n "$stale" ] || continue
+  [ -n "$(container_of_pid "$pid")" ] && continue   # inside a container: handled by image updates
   cmd=$(tr '\0' ' ' <"$proc_dir/cmdline" 2>/dev/null | cut -c1-100)
   warn "PID $pid still uses a replaced PHP file ($stale): ${cmd:-?}"
   COUNT_STALE_OTHER=$((COUNT_STALE_OTHER+1))
@@ -507,6 +566,7 @@ normalize_listen() {
   local s=$1; s=${s#unix:}; s=${s#fcgi://}; s=${s%/}; s=${s%%|*}
   [[ $s =~ ^[0-9]+$ ]] && s="127.0.0.1:$s"
   s=${s/#localhost:/127.0.0.1:}
+  s=${s/#\/var\/run\//\/run\/}
   echo "$s"
 }
 add_socket() {
@@ -514,11 +574,31 @@ add_socket() {
   [[ " ${SOCKET_VHOSTS[$k]:-} " == *" $2 "* ]] || SOCKET_VHOSTS[$k]+="${SOCKET_VHOSTS[$k]:+ }$2"
 }
 
+# nginx upstream blocks: name -> server addresses (e.g. "php-handler" -> 127.0.0.1:9000)
+declare -A NGINX_UPSTREAM
+while IFS=$'\t' read -r up_name up_server; do
+  [ -n "$up_name" ] && NGINX_UPSTREAM[$up_name]+="${NGINX_UPSTREAM[$up_name]:+ }$up_server"
+done < <(awk '
+  { line=$0; sub(/#.*/, "", line) }
+  line ~ /^[ \t]*upstream[ \t]+[^ \t{]+/ { name=line; sub(/^[ \t]*upstream[ \t]+/, "", name); sub(/[ \t{].*$/, "", name); inup=1 }
+  inup { rest=line
+         while (match(rest, /(^|[ \t;{])server[ \t]+[^; \t]+/)) {
+           s=substr(rest, RSTART, RLENGTH); sub(/^.*server[ \t]+/, "", s); print name "\t" s
+           rest=substr(rest, RSTART+RLENGTH) } }
+  inup && line ~ /\}/ { inup=0 }' /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null)
+
 for conf_file in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
   [ -f "$conf_file" ] || continue
   vhost=$(grep -m1 -E '^[[:space:]]*server_name[[:space:]]' "$conf_file" | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/[;[:space:]].*//')
   vhost=${vhost:-$(basename "$conf_file")}
-  while read -r sock; do [ -n "$sock" ] && add_socket "$sock" "$vhost"; done < <(
+  while read -r sock; do
+    [ -n "$sock" ] || continue
+    if [ -n "${NGINX_UPSTREAM[$sock]:-}" ]; then
+      for up_server in ${NGINX_UPSTREAM[$sock]}; do add_socket "$up_server" "$vhost"; done
+    else
+      add_socket "$sock" "$vhost"
+    fi
+  done < <(
     grep -E '^[^#]*fastcgi_pass' "$conf_file" | grep -oE 'fastcgi_pass[[:space:]]+[^;]+' | sed -E 's/fastcgi_pass[[:space:]]+//' | sort -u)
 done
 
@@ -674,9 +754,37 @@ for pool_file in "${POOL_FILES[@]}"; do
 done
 [ "$pool_count" = 0 ] && info "No PHP-FPM pool configuration found."
 
-COUNT_UNMATCHED=0
+# Host ports published by running containers: host port -> container name
+declare -A CONTAINER_BY_HOSTPORT
+if [ "$HAVE_DOCKER" = 1 ]; then
+  while IFS=$'\t' read -r cname cports; do
+    IFS=',' read -ra port_list <<<"$cports"
+    for port in ${port_list[@]+"${port_list[@]}"}; do
+      [[ $port == *"->"* ]] || continue
+      host_port=${port%%->*}; host_port=${host_port##*:}
+      CONTAINER_BY_HOSTPORT[$host_port]=$cname
+    done
+  done < <(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null)
+fi
+
 for sock in "${!SOCKET_VHOSTS[@]}"; do
   [ -n "${SOCKET_MATCHED[$sock]+x}" ] && continue
+  if [[ $sock =~ :([0-9]+)$ ]] && [ -n "${CONTAINER_BY_HOSTPORT[${BASH_REMATCH[1]}]:-}" ]; then
+    printf '\n'
+    info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
+    info "${C_DIM}served by container ${CONTAINER_BY_HOSTPORT[${BASH_REMATCH[1]}]}: its PHP and ports are checked in section 6${C_RESET}"
+    continue
+  fi
+  if [[ $sock == *fcgiwrap* ]]; then
+    printf '\n'
+    info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
+    if [ -S "$sock" ]; then
+      info "${C_DIM}fcgiwrap is a CGI wrapper (usually Perl/shell CGI), not PHP-FPM: not part of this audit.${C_RESET}"
+    else
+      info "${C_DIM}fcgiwrap (CGI wrapper, not PHP-FPM) socket does not exist: CGI on this site is not working.${C_RESET}"
+    fi
+    continue
+  fi
   if [ "$COUNT_UNMATCHED" = 0 ]; then
     printf '\n'; warn "FastCGI addresses used by vhosts but not matched to any pool file: their PHP was NOT audited"
   fi
@@ -685,7 +793,7 @@ for sock in "${!SOCKET_VHOSTS[@]}"; do
   owner=""
   if command -v ss >/dev/null 2>&1; then
     if [[ $sock == /* ]]; then
-      owner=$(ss -lxpH 2>/dev/null | awk -v s="$sock" '$0 ~ s {print $NF; exit}')
+      owner=$(ss -lxpH 2>/dev/null | awk -v s="$sock" 'index($0, s) {print $NF; exit}')
     elif [[ $sock =~ :([0-9]+)$ ]]; then
       owner=$(ss -ltnpH "sport = :${BASH_REMATCH[1]}" 2>/dev/null | awk '{print $NF; exit}')
     fi
@@ -693,7 +801,7 @@ for sock in "${!SOCKET_VHOSTS[@]}"; do
   info "${C_DIM}listening process: ${owner:-none found (nothing listens, or another host/container)}${C_RESET}"
   case $owner in
     *docker-proxy*|*containerd*|*conmon*)
-      advise "Served by a container: update its image (docker pull + recreate) and check the PHP version inside it." ;;
+      info "${C_DIM}served by a container: see section 6 for its PHP version and published ports${C_RESET}" ;;
   esac
 done
 [ "$COUNT_UNMATCHED" -gt 0 ] && raise_exit 1
@@ -762,7 +870,65 @@ if [ ${#FCGID_ENTRIES[@]} -gt 0 ]; then
 fi
 
 # =============================================================================
-header "6. Per-directory overrides (.user.ini / .htaccess)"
+header "6. Containers: published ports and PHP inside"
+if [ "$HAVE_DOCKER" = 0 ]; then
+  info "Docker is not installed or not running."
+else
+  container_count=0
+  while IFS=$'\t' read -r cname cimage cports; do
+    [ -n "$cname" ] || continue
+    container_count=$((container_count+1))
+    printf '\n  %s%s%s [%s]\n' "$C_BOLD" "$cname" "$C_RESET" "$cimage"
+    # Ports published on all interfaces (Docker's own iptables rules bypass ufw)
+    declare -A port_seen=()
+    IFS=',' read -ra port_list <<<"$cports"
+    for port in ${port_list[@]+"${port_list[@]}"}; do
+      port=${port# }
+      [[ $port == *"->"* ]] || continue
+      case $port in 0.0.0.0:*|"[::]:"*|":::"*) ;; *) continue ;; esac
+      host_port=${port%%->*}; host_port=${host_port##*:}
+      container_port=${port##*->}
+      [ -n "${port_seen[$host_port/$container_port]+x}" ] && continue
+      port_seen[$host_port/$container_port]=1
+      case ${container_port%%/*} in
+        900[0-9])
+          bad "FastCGI port published on ALL interfaces: $host_port -> $container_port (remote code execution, bypasses ufw)"
+          advise "Bind it to localhost in the compose file: \"127.0.0.1:$host_port:${container_port%%/*}\", then recreate the container"
+          COUNT_EXPOSED_FASTCGI=$((COUNT_EXPOSED_FASTCGI+1)); raise_exit 2 ;;
+        3306|5432|6379|11211|27017|9200)
+          bad "Database/cache port published on ALL interfaces: $host_port -> $container_port (bypasses ufw)"
+          advise "Bind it to 127.0.0.1, or remove the mapping if only other containers use it"
+          COUNT_EXPOSED_DB=$((COUNT_EXPOSED_DB+1)); raise_exit 1 ;;
+        *)
+          info "published on all interfaces: $host_port -> $container_port (bypasses ufw; make sure this is intended)" ;;
+      esac
+    done
+    unset port_seen
+    # PHP inside the container
+    version=$(container_php_version "$cname")
+    if [ -z "$version" ]; then
+      info "${C_DIM}no PHP inside${C_RESET}"
+    else
+      status=$(container_php_status "$version")
+      if [ "$status" = fixed ]; then
+        ok "PHP $version inside: $(status_label fixed)"
+      else
+        bad "PHP $version inside: $(status_label "$status")"
+        advise "Pull a patched image and recreate (docker compose pull && docker compose up -d), then verify: docker exec $cname php -v"
+        [ "$status" = pre54 ] || [ "${version%%.*}" -lt 8 ] 2>/dev/null && \
+          info "This PHP branch gets no fixes in official images: the application needs a newer PHP / image."
+        if [ -z "${CONTAINER_REPORTED[$cname]+x}" ]; then
+          CONTAINER_REPORTED[$cname]=1; COUNT_CONTAINER_VULN=$((COUNT_CONTAINER_VULN+1))
+        fi
+        raise_exit 2
+      fi
+    fi
+  done < <(docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}' 2>/dev/null)
+  [ "$container_count" = 0 ] && info "No running container."
+fi
+
+# =============================================================================
+header "7. Per-directory overrides (.user.ini / .htaccess)"
 if [ "$USER_OVERRIDE_RISK" = 0 ]; then
   info "Skipped: no vulnerable PHP serves requests without admin-locked mitigations."
 else
@@ -793,11 +959,14 @@ else
 fi
 
 # =============================================================================
-header "7. Summary"
+header "8. Summary"
 if [ "$EXIT_CODE" = 0 ]; then
   ok "Every PHP serving requests is patched, no restart or reload is pending. Nothing to do."
 else
   [ "$COUNT_VULN_RUNNING" -gt 0 ]   && bad  "Vulnerable or unverifiable RUNNING PHP processes: $COUNT_VULN_RUNNING"
+  [ "$COUNT_EXPOSED_FASTCGI" -gt 0 ] && bad "Container FastCGI ports published on all interfaces: $COUNT_EXPOSED_FASTCGI"
+  [ "$COUNT_CONTAINER_VULN" -gt 0 ]  && bad "Running containers with vulnerable or unknown PHP: $COUNT_CONTAINER_VULN"
+  [ "$COUNT_EXPOSED_DB" -gt 0 ]      && warn "Container database/cache ports published on all interfaces: $COUNT_EXPOSED_DB"
   [ "$COUNT_NEEDS_RESTART" -gt 0 ]  && bad  "Patched package, but restart pending: $COUNT_NEEDS_RESTART"
   [ "$COUNT_STALE_OTHER" -gt 0 ]    && warn "Other processes still running a replaced PHP binary: $COUNT_STALE_OTHER"
   [ "$COUNT_PENDING_CONFIG" -gt 0 ] && warn "Config changes waiting for a reload: $COUNT_PENDING_CONFIG"
@@ -810,6 +979,15 @@ else
   step=0
   action() { step=$((step+1)); printf '   %d. %s\n' "$step" "$1"; shift; local line; for line in "$@"; do printf '      %s\n' "$line"; done; }
 
+  if [ "$COUNT_EXPOSED_FASTCGI" -gt 0 ] || [ "$COUNT_EXPOSED_DB" -gt 0 ]; then
+    action "FIRST: bind the container ports flagged in section 6 to 127.0.0.1 (compose: \"127.0.0.1:HOST:CONTAINER\")," \
+           "recreate the containers, and verify from another host that the port is closed (nc -vz -w3 <ip> <port>)." \
+           "An exposed FastCGI port allows code execution without any PHP bug: check the mounted volumes for webshells."
+  fi
+  if [ "$COUNT_CONTAINER_VULN" -gt 0 ]; then
+    action "Update the container images with vulnerable PHP (section 6): docker compose pull && docker compose up -d," \
+           "then verify with: docker exec <container> php -v. EOL PHP branches need a newer application image."
+  fi
   if [ "$COUNT_VULN_RUNNING" -gt 0 ]; then
     action "Update PHP: 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12; for old branches (5.6-8.1) a backported" \
            "package (Debian/Ubuntu: packages.sury.org). Package-only upgrade (Debian/Ubuntu):" \
@@ -842,14 +1020,14 @@ else
            "start / reinstall that PHP-FPM, move the site to another PHP version, or disable the site."
   fi
   if [ "${COUNT_UNMATCHED:-0}" -gt 0 ]; then
-    action "Check the FastCGI addresses listed in section 4: find what serves them (container, other" \
-           "host) and verify that PHP separately, or disable the site if nothing should serve it."
+    action "Check the FastCGI addresses listed in section 4: find what serves them (another host, a stopped" \
+           "container...) and verify that PHP separately, or disable the site if nothing should serve it."
   fi
   if [ "${override_files:-0}" -gt 0 ]; then
-    action "Remove or neutralise the .user.ini / .htaccess overrides listed in section 6, and lock the" \
+    action "Remove or neutralise the .user.ini / .htaccess overrides listed in section 7, and lock the" \
            "settings with php_admin_flag / php_admin_value."
   fi
-  if [ "$COUNT_VULN_RUNNING" -gt 0 ] || [ "$COUNT_NEEDS_RESTART" -gt 0 ]; then
+  if [ "$COUNT_VULN_RUNNING" -gt 0 ] || [ "$COUNT_NEEDS_RESTART" -gt 0 ] || [ "$COUNT_CONTAINER_VULN" -gt 0 ] || [ "$COUNT_EXPOSED_FASTCGI" -gt 0 ]; then
     action "After patching: look for signs of compromise (repeated 500 errors after multipart POSTs," \
            "unknown PHP files, new admin users, suspicious outbound connections)."
   fi
