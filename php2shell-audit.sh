@@ -29,6 +29,13 @@
 # package changelog.
 #
 # Changelog:
+#   2.0.1 (2026-10-22)  nginx: access control per server block (auth_basic,
+#                       deny all, limit_except) and the ISPConfig hint for the
+#                       multipart block. Generic system directories (e.g. a
+#                       "root /usr/share/;" of phpMyAdmin) and nested roots are
+#                       not searched as web roots. PHP under uploads/ grouped
+#                       by plugin/theme directory, tiny index.php placeholders
+#                       skipped (the webshell search still covers them).
 #   2.0.0 (2026-10-22)  Version number. Server-level php_admin_* in the Apache
 #                       config recognised for mod_php. Section 8: multipart
 #                       blocks (Apache/nginx), per-vhost access control
@@ -44,7 +51,7 @@ set -u
 export LC_ALL=C
 shopt -s nullglob
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 CVE_RE='CVE-2026-109618|CVE-2026-109619'
 EXIT_CODE=0
 raise_exit() { [ "$1" -gt "$EXIT_CODE" ] && EXIT_CODE=$1; return 0; }
@@ -1349,6 +1356,28 @@ else
   info "${C_DIM}No vulnerable PHP serves requests: multipart blocking is not needed (temporary blocks can be removed, they break uploads).${C_RESET}"
 fi
 
+# $1 protected "name[tags]" lines, $2 public names, $3 apache|nginx
+print_access_summary() {
+  printf '\n'
+  info "Access control in front of PHP (found in the vhost config$([ "$3" = apache ] && echo ' and the document root .htaccess'); check its scope by hand):"
+  if [ -n "$1" ]; then
+    ok "$(grep -c . <<<"$1") vhost name(s) behind a password, an IP list or a method limit, or without PHP files:"
+    print_name_list <<<"$1"
+  fi
+  if [ -n "$2" ]; then
+    info "$(grep -c . <<<"$2") vhost name(s) serve the vulnerable PHP to anyone (only the multipart block and the PHP settings protect them):"
+    print_name_list <<<"$2"
+    if [ "$3" = apache ]; then
+      advise "Admin tools, webmail, rarely used sites: an Apache-level password and/or IP list for the whole vhost"
+      info "    (<Location \"/\"> AuthType Basic ... <RequireAll> Require valid-user + Require ip ... </RequireAll>), or allow"
+    else
+      advise "Admin tools, webmail, rarely used sites: auth_basic + auth_basic_user_file and/or allow ...; deny all;"
+      info "    in the server block (ISPConfig: the site's \"nginx Directives\"), or limit_except GET { deny all; }; or allow"
+    fi
+    info "    only GET/HEAD; unused sites: disable them (a name pointing elsewhere is still reachable via the Host header)."
+  fi
+}
+
 print_name_list() {   # stdin: names -> wrapped info lines
   grep . | sort -u | tr '\n' ' ' | fold -s -w 96 | { while IFS= read -r wrapped || [ -n "$wrapped" ]; do info "  ${wrapped% }"; wrapped=""; done; }
 }
@@ -1429,19 +1458,7 @@ if pgrep -x 'apache2|httpd' >/dev/null 2>&1; then
       if [ -n "${VH_PUBLIC[$n]+x}" ]; then public_list+="$n"$'\n'
       else t=${VH_TAGS[$n]%,}; t=$(tr ',' '\n' <<<"$t" | sort -u | tr '\n' ',' ); protected_list+="$n[${t%,}]"$'\n'; fi
     done
-    printf '\n'
-    info "Access control in front of PHP (checked in the vhost config and the document root .htaccess; check the scope by hand):"
-    if [ -n "$protected_list" ]; then
-      ok "$(grep -c . <<<"$protected_list") vhost name(s) behind a password, an IP list or a method limit, or without PHP files:"
-      print_name_list <<<"$protected_list"
-    fi
-    if [ -n "$public_list" ]; then
-      info "$(grep -c . <<<"$public_list") vhost name(s) serve the vulnerable PHP to anyone (only the multipart block and the PHP settings protect them):"
-      print_name_list <<<"$public_list"
-      advise "Admin tools, webmail, rarely used sites: an Apache-level password and/or IP list for the whole vhost"
-      info "    (<Location \"/\"> AuthType Basic ... <RequireAll> Require valid-user + Require ip ... </RequireAll>), or allow"
-      info "    only GET/HEAD; unused sites: disable them (a name pointing elsewhere is still reachable via the Host header)."
-    fi
+    print_access_summary "$protected_list" "$public_list" apache
   fi
 
   # Version disclosure in the Server header and on error pages
@@ -1466,6 +1483,8 @@ if pgrep -x nginx >/dev/null 2>&1; then
   NGINX_VHOST_FILES=()
   for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do [ -f "$f" ] && NGINX_VHOST_FILES+=("$f"); done
   sb_total=0; sb_blocked=0; sb_open=""
+  declare -A NG_TAGS=() NG_PUBLIC=()
+  NG_ORDER=()
   while IFS=$'\t' read -r sb_file sb_line sb_text; do
     [ -n "$sb_file" ] || continue
     sb_text=${sb_text//$'\037'/$'\n'}
@@ -1479,6 +1498,13 @@ if pgrep -x nginx >/dev/null 2>&1; then
     sb_name=${sb_name:-$(basename "$sb_file"):$sb_line}
     if nginx_text_blocks_multipart "$sb_full" "$MP_VARS"; then sb_blocked=$((sb_blocked+1))
     else sb_open+="$sb_name"$'\n'; fi
+    # access control in front of PHP (anywhere in the block: check the scope by hand)
+    tags=""
+    grep -E '(^|[[:space:];{])auth_basic[[:space:]]+' <<<"$sb_full" | grep -qvE 'auth_basic[[:space:]]+off[[:space:]]*;' && tags+="password,"
+    grep -qE '(^|[[:space:];{])deny[[:space:]]+all[[:space:]]*;' <<<"$sb_full" && tags+="IP,"
+    grep -qE '(^|[[:space:];{])limit_except[[:space:]]|if[[:space:]]*\([[:space:]]*\$request_method' <<<"$sb_full" && tags+="method,"
+    [ -n "${NG_TAGS[$sb_name]+x}" ] || NG_ORDER+=("$sb_name")
+    if [ -n "$tags" ]; then NG_TAGS[$sb_name]+="$tags"; else NG_TAGS[$sb_name]+=""; NG_PUBLIC[$sb_name]=1; fi
   done < <(nginx_server_blocks ${NGINX_VHOST_FILES[@]+"${NGINX_VHOST_FILES[@]}"})
   sb_open_count=$(grep -c . <<<"$sb_open")
   info "server blocks passing to PHP-FPM: $sb_total | multipart blocked: $sb_blocked | NOT blocked: $sb_open_count"
@@ -1493,7 +1519,16 @@ if pgrep -x nginx >/dev/null 2>&1; then
     if [ "$NEED_FILTER" = 1 ]; then
       advise "In the http {} context:  map \$http_content_type \$php2shell_multipart { default 0; ~*multipart 1; }"
       advise "In every server {} that does not need uploads:  if (\$php2shell_multipart) { return 403; }"
+      advise "(ISPConfig regenerates vhost files: put the if into /etc/nginx/fastcgi_params and fastcgi.conf, which every PHP location includes)"
     fi
+  fi
+  if [ "$NEED_FILTER" = 1 ] && [ ${#NG_ORDER[@]} -gt 0 ]; then
+    protected_list=""; public_list=""
+    for n in "${NG_ORDER[@]}"; do
+      if [ -n "${NG_PUBLIC[$n]+x}" ]; then public_list+="$n"$'\n'
+      else t=$(tr ',' '\n' <<<"${NG_TAGS[$n]%,}" | sort -u | tr '\n' ','); protected_list+="$n[${t%,}]"$'\n'; fi
+    done
+    print_access_summary "$protected_list" "$public_list" nginx
   fi
 fi
 if [ "$NEED_FILTER" = 1 ] && [ "$((COUNT_NO_MULTIPART_BLOCK + COUNT_WRONG_BLOCK))" -lt 1 ] \
@@ -1643,11 +1678,17 @@ WEB_ROOTS=()
 for r in /var/www /srv/www /srv/http /home; do [ -d "$r" ] && WEB_ROOTS+=("$r"); done
 # document roots outside those directories
 while IFS= read -r d; do
+  d=${d%/}; [ -n "$d" ] || continue
   [ -d "$d" ] || continue
   case "$d/" in /var/www/*|/srv/www/*|/srv/http/*|/home/*) continue ;; esac
-  WEB_ROOTS+=("$d")
+  # generic system directories (e.g. "root /usr/share/;" for phpMyAdmin in ISPConfig) are not web roots
+  case "$d" in /|/usr|/usr/share|/usr/lib|/usr/local|/var|/var/lib|/var/cache|/etc|/opt|/srv|/tmp|/root|/boot|/proc|/sys|/dev|/run) continue ;; esac
+  # skip a root that lies inside one already listed (it would be searched twice)
+  inside=0; for r in ${WEB_ROOTS[@]+"${WEB_ROOTS[@]}"}; do case "$d/" in "$r"/*) inside=1 ;; esac; done
+  [ "$inside" = 0 ] && WEB_ROOTS+=("$d")
 done < <( { for f in $(apache_vhost_files); do grep -vE '^[[:space:]]*#' "$f" | awk 'tolower($1) == "documentroot" {gsub(/"/, "", $2); print $2}'; done
-            for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do [ -f "$f" ] && sed -E 's/#.*//' "$f" | awk '$1 == "root" {sub(/;.*/, "", $2); gsub(/"/, "", $2); print $2}'; done; } 2>/dev/null | sort -u)
+            for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do [ -f "$f" ] && sed -E 's/#.*//' "$f" | awk '$1 == "root" {sub(/;.*/, "", $2); gsub(/"/, "", $2); print $2}'; done; } 2>/dev/null \
+          | sed -E 's#/+$##' | sort -u | awk '{print length($0) "\t" $0}' | sort -n | cut -f2-)
 WEBSHELL_RE='eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|rawurldecode|\$_(POST|GET|REQUEST|COOKIE|SERVER))|assert[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)|(system|passthru|shell_exec|popen|proc_open|pcntl_exec)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE|SERVER)|[^_a-z]exec[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)|create_function[[:space:]]*\(.*\$_(POST|GET|REQUEST|COOKIE)'
 if [ ${#WEB_ROOTS[@]} -eq 0 ]; then
   info "No web root found."
@@ -1682,12 +1723,16 @@ else
   # PHP files under uploads/ (any age); tiny "Silence is golden" placeholders are skipped
   upl_real=$(cut -f2,3,4 <<<"$upl_list" | while IFS=$'\t' read -r t u p; do
                [ -n "$p" ] || continue
-               if [ "$(stat -c %s "$p" 2>/dev/null || echo 0)" -lt 200 ] && grep -qi 'silence is golden' "$p" 2>/dev/null; then continue; fi
+               # tiny placeholders ("Silence is golden", index.php against directory listing); the webshell
+               # pattern search above has already looked at every one of them
+               sz=$(stat -c %s "$p" 2>/dev/null || echo 0)
+               if [ "$sz" -lt 200 ] && { grep -qi 'silence is golden' "$p" 2>/dev/null || [ "${p##*/}" = index.php ]; }; then continue; fi
                echo "$t  $u  $p"; done)
   if [ -n "$upl_real" ]; then
-    # grouped by directory: count, newest date, owner (a theme or plugin cache shows up as one line)
+    # grouped by uploads/<plugin or theme directory>: count, newest date, owner
     check "PHP file(s) under an uploads/ directory (uploads should never contain PHP; caches of themes/plugins are a common harmless case):"
-    awk '{ d = $4; sub(/\/[^\/]*$/, "", d); n[d]++; if ($1 " " $2 > newest[d]) newest[d] = $1 " " $2; owner[d] = $3 }
+    awk '{ d = $4; if (match(d, /\/uploads\/[^\/]+\//)) d = substr(d, 1, RSTART + RLENGTH - 2); else sub(/\/[^\/]*$/, "", d)
+           n[d]++; if ($1 " " $2 > newest[d]) newest[d] = $1 " " $2; owner[d] = $3 }
          END { for (d in n) printf "%s  %4d file(s), newest %s, owner %s\n", d, n[d], newest[d], owner[d] }' <<<"$upl_real" \
       | sort | show_limited 20 info
   fi
