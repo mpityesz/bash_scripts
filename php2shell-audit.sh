@@ -148,6 +148,30 @@ process_start_time() {   # process start time (epoch seconds)
 
 parent_pid() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $2}'; }
 
+# PHP-FPM and Apache keep their PID on reload (they re-exec themselves), so the process
+# start time alone is not the time the current config was loaded. Look at the systemd
+# journal ("Reloaded ...") and the FPM log ("ready to handle connections") as well.
+# $1 pid, $2 optional php-fpm.conf -> prints the latest (re)load epoch time
+effective_load_time() {
+  local pid=$1 conf=${2:-} start unit t latest log line
+  start=$(process_start_time "$pid"); latest=${start:-0}
+  unit=$(grep -oE '[^/]+\.service' "/proc/$pid/cgroup" 2>/dev/null | head -n1)
+  if [ -n "$unit" ] && [ -n "$start" ] && command -v journalctl >/dev/null 2>&1; then
+    t=$(journalctl -u "$unit" --since "@$start" -o short-unix --no-pager -q 2>/dev/null \
+        | awk '/Reloaded|Started/ {t=$1} END {if (t) print int(t)}')
+    [ -n "$t" ] && [ "$t" -gt "$latest" ] && latest=$t
+  fi
+  if [ -n "$conf" ] && [ -r "$conf" ]; then
+    log=$(awk '/^[ \t]*error_log[ \t]*=/ {v=substr($0, index($0, "=")+1); gsub(/^[ \t"]+|[ \t"]+$/, "", v); print v; exit}' "$conf")
+    if [ -n "$log" ] && [ -r "$log" ]; then
+      line=$(tail -n 2000 "$log" | grep -E 'ready to handle connections' | tail -n1 | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+      [ -n "$line" ] && t=$(date -d "$line" +%s 2>/dev/null) && [ -n "$t" ] && [ "$t" -gt "$latest" ] && latest=$t
+    fi
+  fi
+  [ "$latest" -gt 0 ] && echo "$latest"
+  return 0
+}
+
 HAVE_DOCKER=0
 command -v docker >/dev/null 2>&1 && $TIMEOUT_CMD docker info >/dev/null 2>&1 && HAVE_DOCKER=1
 declare -A CONTAINER_NAME_CACHE
@@ -466,7 +490,9 @@ check_running() {
   key=$(readlink -f "$clean_path" 2>/dev/null || echo "$clean_path")
   if [[ $key == *.so ]]; then probe_module "$key"; else probe_binary "$key" || true; fi
   RUNNING_BIN[$key]=1
-  start=$(process_start_time "$pid"); mtime=$(stat -c %Y "$key" 2>/dev/null || echo 0)
+  if [[ $desc == PHP-FPM* ]]; then start=$(effective_load_time "$pid" "${1:-}")
+  else start=$(effective_load_time "$pid"); fi
+  mtime=$(stat -c %Y "$key" 2>/dev/null || echo 0)
   if [ -n "$start" ] && { [ -z "${RUNNING_START[$key]:-}" ] || [ "$start" -lt "${RUNNING_START[$key]}" ]; }; then
     RUNNING_START[$key]=$start
   fi
