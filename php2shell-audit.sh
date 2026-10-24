@@ -7,15 +7,18 @@
 #  * READ-ONLY: it does not change anything.
 #  * Run as root:      bash php2shell-audit.sh
 #  * Without colors:   bash php2shell-audit.sh --no-color
-#  * Compromise checks look back to 2026-10-20 15:00 UTC (first public leak);
+#  * Compromise checks look back to 2026-10-17 00:00 UTC (AWS saw the first
+#    exploitation attempts on 2026-10-17);
 #    another start:    bash php2shell-audit.sh --since '2026-10-21 14:00 UTC'
 #
 # Exit codes:
 #   0 = every running PHP is patched, nothing to do
 #   1 = warnings: a vulnerable PHP is installed but not serving requests,
 #       a non-web process still runs a replaced PHP binary, a config change
-#       is waiting for a reload, or a vhost serving vulnerable PHP has no
-#       multipart block
+#       is waiting for a reload, a vhost serving vulnerable PHP has no
+#       multipart block, session.upload_progress is enabled on an otherwise
+#       patched PHP (CVE-2026-115560), the web server service is in a failed
+#       state, or a compromise search could not finish (INCOMPLETE)
 #   2 = a vulnerable (or unverifiable) PHP is serving requests, OR the package
 #       is patched but the old (not restarted) process is still running,
 #       OR a strong sign of compromise was found (section 9)
@@ -23,12 +26,32 @@
 # "[CHECK]" lines (section 9) are items to review by hand; they do not change
 # the exit code.
 #
-# Official fixed releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12.
+# Official fixed releases: 8.2.35, 8.3.36, 8.4.27, 8.5.12. These fix
+# CVE-2026-109618 / CVE-2026-109619 but NOT CVE-2026-115560 (session.upload_progress),
+# which is reported separately even on a patched PHP.
 # Older branches (5.6, 7.x, 8.0, 8.1) can only be fixed by a distribution /
-# sury.org backport: this is detected by looking for the CVE IDs in the
-# package changelog.
+# sury.org backport: this is detected by requiring BOTH CVE IDs in the
+# package changelog (an EOL distribution such as Debian 9 has no such backport).
 #
 # Changelog:
+#   2.1.0 (2026-10-24)  --since defaults to 2026-10-17 00:00 UTC. CVE-2026-115560:
+#                       session.upload_progress reported per PHP version even when
+#                       patched. Backport detection requires both CVE IDs. Failed
+#                       web server service flagged ([WARN]); masked / stopped noted.
+#                       Section 4: idle FPM versions (no vhost) and leftover pool
+#                       configs collapsed to one summary line each; the ISPConfig
+#                       panel pool memory_limit = -1 accepted silently. Section 8:
+#                       the multipart / "serves vulnerable PHP" warning is limited to
+#                       vhosts whose backend PHP is actually vulnerable, and an in-vhost
+#                       <Location>/<Directory> block no longer marks the whole vhost
+#                       blocked; a cgroup limit above the machine's RAM counts as
+#                       unlimited. A FastCGI socket nothing listens on is a broken site,
+#                       not un-audited PHP. Section 9: modified files grouped by
+#                       directory; ctime as well as mtime; /tmp, /var/tmp, /dev/shm
+#                       scanned; dpkg --verify of the PHP packages; persistence hits
+#                       annotated with their source; INCOMPLETE marker on timed-out /
+#                       capped searches. 8.5: fatal_error_backtraces and
+#                       upload_max_filesize < post_max_size checked. Three-part summary.
 #   2.0.2 (2026-10-22)  nginx: access tags only count directives at server
 #                       level, in "location /" and in PHP locations, so the
 #                       ISPConfig dotfile "deny all" and the /stats/ auth no
@@ -55,13 +78,16 @@ set -u
 export LC_ALL=C
 shopt -s nullglob
 
-SCRIPT_VERSION="2.0.2"
-CVE_RE='CVE-2026-109618|CVE-2026-109619'
+SCRIPT_VERSION="2.1.0"
+CVE_1='CVE-2026-109618'; CVE_2='CVE-2026-109619'
+CVE_RE="$CVE_1|$CVE_2"      # either CVE (for display / hints)
+# CVE-2026-115560: session.upload_progress is exploitable even on the fixed releases.
+CVE_UP='CVE-2026-115560'
 EXIT_CODE=0
 raise_exit() { [ "$1" -gt "$EXIT_CODE" ] && EXIT_CODE=$1; return 0; }
 
 USE_COLOR=1
-SINCE_ARG="2026-10-20 15:00 UTC"
+SINCE_ARG="2026-10-17 00:00 UTC"
 while [ $# -gt 0 ]; do
   case $1 in
     --no-color) USE_COLOR=0 ;;
@@ -100,6 +126,7 @@ COUNT_VULN_RUNNING=0; COUNT_NEEDS_RESTART=0; COUNT_VULN_INSTALLED=0
 COUNT_STALE_OTHER=0; COUNT_PENDING_CONFIG=0; COUNT_DOWN_POOLS=0
 COUNT_CONTAINER_VULN=0; COUNT_EXPOSED_FASTCGI=0; COUNT_EXPOSED_DB=0; COUNT_UNMATCHED=0
 COUNT_NO_MULTIPART_BLOCK=0; COUNT_WRONG_BLOCK=0; COUNT_RLIMIT=0; COUNT_IOC=0; COUNT_REVIEW=0
+COUNT_UPLOAD_PROGRESS=0; COUNT_WEBSERVER_FAILED=0; COUNT_INCOMPLETE=0
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -144,24 +171,28 @@ package_candidate() {   # newest version known to the local apt cache (dpkg only
   apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ && $2 != "(none)" {print $2; exit}'
 }
 
-# 0 = changelog references the CVEs, 1 = it does not, 2 = no changelog available to check
+# A backport only counts as a fix when the changelog references BOTH CVEs (the two
+# PHP2Shell flaws were fixed together; a reference to just one is not proof of the fix).
+# 0 = changelog references both CVEs, 1 = it does not, 2 = no changelog available to check
 changelog_has_fix() {
-  local pkg=${1%%:*} base="" dir file seen=0 log
+  local pkg=${1%%:*} base="" dir file seen=0 log have1=0 have2=0
   if [ "$HAVE_DPKG" = 1 ]; then
     [[ $pkg =~ (php[0-9]+(\.[0-9]+)?) ]] && base=${BASH_REMATCH[1]}
     for dir in "/usr/share/doc/$pkg" ${base:+"/usr/share/doc/$base-common"}; do
       for file in "$dir/changelog.Debian.gz" "$dir/changelog.gz" "$dir/NEWS.Debian.gz"; do
         [ -r "$file" ] || continue
         seen=1
-        zgrep -Eq "$CVE_RE" "$file" 2>/dev/null && return 0
+        zgrep -Fq "$CVE_1" "$file" 2>/dev/null && have1=1
+        zgrep -Fq "$CVE_2" "$file" 2>/dev/null && have2=1
       done
     done
+    [ "$have1" = 1 ] && [ "$have2" = 1 ] && return 0
     [ "$seen" = 1 ] && return 1
     return 2
   elif [ "$HAVE_RPM" = 1 ]; then
     log=$(rpm -q --changelog "$pkg" 2>/dev/null)
     [ -n "$log" ] || return 2
-    grep -Eq "$CVE_RE" <<<"$log" && return 0
+    grep -Fq "$CVE_1" <<<"$log" && grep -Fq "$CVE_2" <<<"$log" && return 0
     return 1
   fi
   return 2
@@ -225,6 +256,13 @@ effective_load_time() {
 HAVE_DOCKER=0
 command -v docker >/dev/null 2>&1 && $TIMEOUT_CMD docker info >/dev/null 2>&1 && HAVE_DOCKER=1
 declare -A CONTAINER_NAME_CACHE
+# Declared here (before section 3) because report_container_process assigns CONTAINER_STATUS
+# during section 3, which runs before the vhost-collection block below. Under set -u, assigning
+# a subscript to a not-yet-associative name treats the key as an arithmetic index and aborts.
+# Backend PHP status per normalized socket (fixed|vuln|unverified|pre54|broken|unknown), for section 8.
+declare -A SOCKET_STATUS=()
+# PHP status per container name (set in sections 3 and 6), for section 8.
+declare -A CONTAINER_STATUS=()
 
 container_of_pid() {   # prints the container name (or short id) a process runs in; empty on the host
   local id name=""
@@ -279,7 +317,7 @@ ini_get() {
 # -----------------------------------------------------------------------------
 # Binary registry (key: resolved real path)
 # -----------------------------------------------------------------------------
-declare -A BIN_VERSION BIN_SAPI BIN_PKG BIN_PKG_VERSION BIN_STATUS BIN_NOTE BIN_INI_FILES
+declare -A BIN_VERSION BIN_SAPI BIN_PKG BIN_PKG_VERSION BIN_STATUS BIN_NOTE BIN_INI_FILES BIN_CANDIDATE
 BIN_ORDER=()
 
 classify_binary() {   # $1 = key; BIN_VERSION[$1] must already be set
@@ -310,10 +348,15 @@ classify_binary() {   # $1 = key; BIN_VERSION[$1] must already be set
         BIN_STATUS[$key]=vuln; BIN_NOTE[$key]="below the fixed release, and no CVE reference in the changelog"
       fi ;;
   esac
-  if [ "${BIN_STATUS[$key]}" != fixed ] && [ -n "$pkg" ]; then
+  BIN_CANDIDATE[$key]=""
+  if [ -n "$pkg" ]; then
     candidate=$(package_candidate "$pkg")
     if [ -n "$candidate" ] && [ "$candidate" != "${BIN_PKG_VERSION[$key]}" ]; then
-      BIN_NOTE[$key]+="; newer package in the apt cache: $candidate"
+      BIN_CANDIDATE[$key]=$candidate
+      # A higher version in the apt cache is not itself a fix: an EOL branch gets
+      # newer builds that still carry no PHP2Shell backport. Do not suggest it patches.
+      [ "${BIN_STATUS[$key]}" != fixed ] && \
+        BIN_NOTE[$key]+="; a newer build is in the apt cache ($candidate), but a higher version is not proof of a fix: check its changelog for both CVE IDs before trusting it"
     fi
   fi
 }
@@ -458,7 +501,14 @@ apache_multipart_scan() {
     [ -f "$f" ] || continue
     if [ "$mode" = vhost ]; then apache_expand_includes "$f"; else cat "$f"; fi | awk -v F="$f" '
     function mark(kind) {
-      if (invh) { vhblocked = 1; return }
+      if (invh) {
+        # A block at vhost top level, or inside a catch-all <Location "/"> / the docroot
+        # <Directory>, protects the whole vhost. Inside a narrower <Location>/<Directory>/<Files>
+        # it only protects that path, so it must NOT mark the whole vhost as blocked.
+        if (vsectd == 0 || vcatchall) vhblocked = 1
+        else print "SCOPEDVH\t" F "\t" ifline "\t" (vhname != "" ? vhname : "(no ServerName)")
+        return
+      }
       if (kind == "rw") { print "GLOBALRW\t" F "\t" NR; return }
       if (sect != "") print "SCOPED\t" F "\t" ifline "\t" sect
       else print "GLOBAL\t" F "\t" ifline
@@ -471,7 +521,7 @@ apache_multipart_scan() {
     { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line); low = tolower(line) }
     line == "" || line ~ /^#/ { next }
     low ~ /^<virtualhost[ \t>]/ { invh = 1; vhname = ""; vhblocked = 0; vhredirect = 0; vhredirall = 0; vhdocroot = 0; rwhost = 0
-                                  vhauthtype = 0; vhrequser = 0; vhip = 0; vhmethod = 0; vhroot = ""; next }
+                                  vhauthtype = 0; vhrequser = 0; vhip = 0; vhmethod = 0; vhroot = ""; vsectd = 0; vcatchall = 0; next }
     low ~ /^<\/virtualhost[ \t]*>/ { flush_vh(); invh = 0; next }
     low ~ /^<if[ \t]/ {
       ifd++
@@ -496,6 +546,20 @@ apache_multipart_scan() {
     invh && low ~ /^<limitexcept[ \t]/ { limd = 1; next }
     invh && low ~ /^<\/limitexcept[ \t]*>/ { limd = 0; next }
     invh && limd && (low ~ /^require[ \t]+all[ \t]+denied/ || low ~ /^deny[ \t]+from[ \t]+all/) { vhmethod = 1 }
+    invh && low ~ /^<(directory|directorymatch|location|locationmatch|files|filesmatch|proxy|proxymatch)[ \t>]/ {
+      vsectd++
+      if (vsectd == 1) {
+        vcatchall = 0
+        sp = line; sub(/^<[a-zA-Z]+[ \t]+/, "", sp); sub(/[ \t]*>.*$/, "", sp); gsub(/"/, "", sp)
+        if (low ~ /^<location/ && (sp == "/" || sp == "")) vcatchall = 1
+        if (low ~ /^<directory/ && (sp == "/" || (vhroot != "" && sp == vhroot))) vcatchall = 1
+      }
+      next
+    }
+    invh && low ~ /^<\/(directory|directorymatch|location|locationmatch|files|filesmatch|proxy|proxymatch)[ \t]*>/ {
+      if (vsectd > 0) vsectd--; if (vsectd == 0) vcatchall = 0
+      next
+    }
     !invh && low ~ /^<(directory|directorymatch|location|locationmatch|files|filesmatch|proxy|proxymatch)[ \t>]/ {
       sectd++; if (sectd == 1) { sect = line; sub(/>.*/, ">", sect) }
       next
@@ -612,6 +676,38 @@ nginx_block_access_flags() {   # $1 server block text (comments stripped)
     END { if (a) printf "password "; if (i) printf "IP "; if (m) printf "method " }'
 }
 
+# 0 if any fastcgi_pass backend in the given nginx server block text forwards to a PHP
+# that is not proven patched (vulnerable / unverified / unknown-listening). A patched pool,
+# a broken (nothing-listening) socket and a non-PHP wrapper count as safe.
+nginx_block_backend_vuln() {   # $1 = server block full text
+  local tgt s ns st vuln=1
+  while read -r tgt; do
+    [ -n "$tgt" ] || continue
+    # shellcheck disable=SC2086  # intentional split of the space-separated upstream server list
+    if [ -n "${NGINX_UPSTREAM[$tgt]:-}" ]; then set -- ${NGINX_UPSTREAM[$tgt]}; else set -- "$tgt"; fi
+    for s in "$@"; do
+      ns=$(normalize_listen "$s"); st=${SOCKET_STATUS[$ns]:-}
+      case $st in fixed|broken|'') : ;; *) vuln=0 ;; esac
+    done
+  done < <(sed -E 's/#.*//' <<<"$1" | grep -oE '(^|[[:space:];{])fastcgi_pass[[:space:]]+[^;]+' \
+           | sed -E 's/^.*fastcgi_pass[[:space:]]+//' | sort -u)
+  return $vuln
+}
+
+# 0 if any FastCGI/proxy backend named in the expanded Apache vhost text (on stdin) forwards
+# to a PHP that is not proven patched. Same safe cases as the nginx version.
+apache_vhost_backend_vuln() {
+  local tok ns st vuln=1
+  while read -r tok; do
+    [ -n "$tok" ] || continue
+    ns=$(normalize_listen "$tok"); st=${SOCKET_STATUS[$ns]:-}
+    case $st in fixed|broken|'') : ;; *) vuln=0 ;; esac
+  done < <(grep -vE '^[[:space:]]*#' \
+           | grep -oE 'unix:[^|" ]+|-socket[[:space:]]+[^[:space:]]+|fcgi://[0-9.a-z]+:[0-9]+' \
+           | sed -E 's/^-socket[[:space:]]+//' | sort -u)
+  return $vuln
+}
+
 # Soft RLIMIT_AS / RLIMIT_DATA of a process ("" if unlimited or unknown)
 process_memory_rlimits() {
   awk '/^Max address space|^Max data size/ {
@@ -657,26 +753,33 @@ cgroup_memory_limit() {
   [ -n "${file:-}" ] && [ -r "$file" ] || return 0
   v=$(cat "$file" 2>/dev/null)
   # cgroup v1 reports "no limit" as a huge number (page-aligned LLONG_MAX)
-  if [ "$v" = max ] || [ "${#v}" -ge 19 ]; then echo max; else echo "$v"; fi
+  if [ "$v" = max ] || [ "${#v}" -ge 19 ]; then echo max; return; fi
+  # A limit at or above the machine's RAM cannot actually cap a request: treat it as unlimited.
+  local ram_kb
+  ram_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+  if [ -n "$ram_kb" ] && [[ $v =~ ^[0-9]+$ ]] && [ "$v" -ge $((ram_kb*1024)) ]; then echo max; return; fi
+  echo "$v"
 }
 
 # -----------------------------------------------------------------------------
 # Evaluation + recommendations
 #   evaluate_settings <status> <upload_progress> <upload_progress_source> <memory_limit>
 #                     <memory_locked 0/1> <memory_source> <post_max_size> <mode: pool|modphp|cgi>
+#                     [version] [upload_max_filesize] [fatal_error_backtraces] [panel 0/1]
+# session.upload_progress on a patched PHP (CVE-2026-115560) is reported once per PHP
+# version elsewhere, not here, to avoid one line per pool.
 # -----------------------------------------------------------------------------
 evaluate_settings() {
   local status=$1 upload=$2 upload_src=$3 mem=$4 mem_locked=$5 mem_src=$6 post=$7 mode=$8
-  local post_bytes; post_bytes=$(to_bytes "$post")
+  local version=${9:-} umax=${10:-} fatal=${11:-} panel=${12:-0}
+  local post_bytes umax_bytes; post_bytes=$(to_bytes "$post")
   info "${C_DIM}session.upload_progress.enabled = $upload ($upload_src) | memory_limit = $mem ($mem_src) | post_max_size = $post${C_RESET}"
 
   if [ "$status" = fixed ]; then
-    if [ "$mem" = "-1" ]; then
+    # The ISPConfig panel pool ships memory_limit = -1 (ISPConfig 3.2.8+ default): accept it silently.
+    if [ "$mem" = "-1" ] && [ "$panel" != 1 ]; then
       info "(memory_limit = -1: if you set this as a temporary PHP2Shell mitigation, restore the previous finite value;"
       info " if it was configured like this before (e.g. the ISPConfig panel pool), leave it as is.)"
-    fi
-    if [ "$upload" != "n/a" ] && is_on "$upload"; then
-      info "(Optional hardening: session.upload_progress.enabled = 0, hardly any application uses it.)"
     fi
     return
   fi
@@ -722,6 +825,22 @@ evaluate_settings() {
     warn "post_max_size = $post is too large"
     advise "$fix_post"
   fi
+
+  # PHP's own recommendation: post_max_size should be at least upload_max_filesize.
+  if [ -n "$umax" ]; then
+    umax_bytes=$(to_bytes "$umax")
+    if [ "$post_bytes" != "-1" ] && [ "$post_bytes" -gt 0 ] && [ "$umax_bytes" -gt "$post_bytes" ]; then
+      info "upload_max_filesize = $umax is larger than post_max_size = $post; PHP recommends post_max_size >= upload_max_filesize."
+    fi
+  fi
+
+  # PHP 8.5 only: full backtraces on a fatal error add to the memory the exhaustion path needs.
+  case $version in
+    8.5|8.5.*)
+      if [ "${fatal:-1}" != 0 ]; then
+        advise "fatal_error_backtraces = 0   (PHP 8.5 only: trims the memory a failing request uses)"
+      fi ;;
+  esac
 }
 
 # =============================================================================
@@ -777,6 +896,9 @@ else
   for key in "${BIN_ORDER[@]}"; do
     printf '  %-42s %-15s %-12s %s\n' "$key" "${BIN_SAPI[$key]}" "${BIN_VERSION[$key]%%[-~+]*}" "$(status_label "${BIN_STATUS[$key]}")"
     info "${C_DIM}package: ${BIN_PKG[$key]:--} ${BIN_PKG_VERSION[$key]} | ${BIN_NOTE[$key]}${C_RESET}"
+    # Already fixed, but a newer build exists in the apt cache: informational only.
+    [ "${BIN_STATUS[$key]}" = fixed ] && [ -n "${BIN_CANDIDATE[$key]:-}" ] && \
+      info "${C_DIM}a newer build is in the apt cache (${BIN_CANDIDATE[$key]}); already patched, updating is optional${C_RESET}"
     [ "${BIN_STATUS[$key]}" != fixed ] && COUNT_VULN_INSTALLED=$((COUNT_VULN_INSTALLED+1))
   done
 fi
@@ -795,6 +917,7 @@ report_container_process() {   # $1 pid, $2 description, $3 container, $4 binary
   CONTAINER_REPORTED[$cname]=1
   version=$(container_php_version "$cname" "$exe")
   status=$(container_php_status "$version")
+  CONTAINER_STATUS[$cname]=$status
   [ "$HAVE_DOCKER" = 1 ] && image=$(docker inspect -f '{{.Config.Image}}' "$cname" 2>/dev/null)
   if [ "$status" = fixed ]; then
     ok "$desc in container $cname${image:+ [$image]} (PID $pid): $version $(status_label fixed)"
@@ -805,7 +928,7 @@ report_container_process() {   # $1 pid, $2 description, $3 container, $4 binary
   fi
 }
 
-# $1 pid, $2 description, $3 binary/module path (may end in "(deleted)"), $4.. extra config files
+# $1 pid, $2 description, $3 binary/module path (may end in " (deleted)"), $4.. extra config files
 check_running() {
   local pid=$1 desc=$2 path=$3 clean_path deleted=0 start mtime key cname; shift 3
   CHECKED_PIDS[$pid]=1
@@ -880,6 +1003,28 @@ done
 pgrep -x nginx >/dev/null 2>&1 && info "Nginx is running"
 [ "$found_any" = 0 ] && info "No PHP web process is running (PHP-FPM / mod_php / php-cgi)."
 
+# Web server / PHP-FPM service state. A service in the 'failed' state serves nothing right
+# now, so the sections below look clean, but it is configured to run and would serve requests
+# again once (re)started: flag it so a clean run is not mistaken for a safe server. A masked or
+# intentionally stopped+disabled service is reported as information, with no effect on the exit code.
+if command -v systemctl >/dev/null 2>&1; then
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || continue
+    ws_state=$(systemctl is-active "$unit" 2>/dev/null)
+    ws_enabled=$(systemctl is-enabled "$unit" 2>/dev/null)
+    if [ "$ws_state" = failed ]; then
+      warn "service $unit is in the 'failed' state: it serves nothing now, but it is configured to run."
+      info "    The sections below reflect the server WITHOUT it; re-run the audit once it is started before trusting a clean result."
+      COUNT_WEBSERVER_FAILED=$((COUNT_WEBSERVER_FAILED+1)); raise_exit 1
+    elif [ "$ws_enabled" = masked ]; then
+      info "${C_DIM}service $unit is masked (intentionally disabled): it will not start.${C_RESET}"
+    elif [ "$ws_state" = inactive ] && [ "$ws_enabled" = disabled ]; then
+      info "${C_DIM}service $unit is stopped and disabled (intentionally not running).${C_RESET}"
+    fi
+  done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+           | awk '$1 ~ /^(apache2|httpd|nginx|php[0-9.]*-fpm|php5-fpm)\.service$/ {print $1}' | sort -u)
+fi
+
 # Any other process (queue workers, supervisor jobs, long cron jobs, FPM workers
 # of an unknown master...) that still runs a replaced PHP binary or extension
 printf '\n'
@@ -911,6 +1056,7 @@ fi
 
 # =============================================================================
 # Collect vhosts: socket -> vhosts, fcgid starters, mod_php vhosts
+# (SOCKET_STATUS and CONTAINER_STATUS are declared near the top, before section 3.)
 declare -A SOCKET_VHOSTS
 FCGID_ENTRIES=(); MODPHP_VHOSTS=()
 normalize_listen() {
@@ -996,6 +1142,8 @@ done
 # =============================================================================
 header "4. PHP-FPM pools, their vhosts and recommended settings"
 declare -A SOCKET_MATCHED POOL_BINARY POOL_SEEN
+# Collapsed summaries (section 4 noise reduction): PHP branch (x.y) -> pool count
+declare -A IDLE_RUNNING=() IDLE_STOPPED=() ORPHAN_POOLS=()
 POOL_FILES=()
 
 # Pools included by the running FPM masters (covers custom paths, e.g. /opt builds)
@@ -1051,43 +1199,69 @@ report_pool() {
   local entry k v kind
   for entry in "$@"; do IFS=$'\t' read -r k v kind <<<"$entry"; override[$k]=$v; override_kind[$k]=$kind; done
 
-  local key status version running vhosts norm
+  local key status version running vhosts norm branch panel=0 known=1
   key=$(readlink -f "$fpm_bin" 2>/dev/null || echo "$fpm_bin")
   status=${BIN_STATUS[$key]:-vuln}; version=${BIN_VERSION[$key]:-?}
   running="not running"; [ -n "${RUNNING_BIN[$key]+x}" ] && running="running"
   norm=$(normalize_listen "$listen"); SOCKET_MATCHED[$norm]=1
   vhosts=${SOCKET_VHOSTS[$norm]:-}
+  [ -z "${BIN_VERSION[$key]+x}" ] && known=0
+  case $pool_name in ispconfig) panel=1 ;; esac
 
-  printf '\n  %s[%s]%s %s\n' "$C_BOLD" "$pool_name" "$C_RESET" "$pool_file"
-  if [ -z "${BIN_VERSION[$key]+x}" ]; then
+  # PHP branch (x.y) for the collapsed summary lines
+  if [ "$known" = 1 ]; then branch=$(printf '%s' "${version%%[-~+]*}" | cut -d. -f1-2)
+  else case $pool_file in
+         /etc/php/*/fpm/*) branch=${pool_file#/etc/php/}; branch=${branch%%/*} ;;
+         /etc/php5/*)      branch=5 ;;
+         *)                branch="?" ;;
+       esac
+  fi
+
+  # Record the backend PHP status for this socket, so section 8 can tell which vhosts
+  # really forward to a vulnerable PHP.
+  if [ "$known" = 1 ]; then SOCKET_STATUS[$norm]=$status; else SOCKET_STATUS[$norm]=unknown; fi
+
+  # --- leftover config: the FPM binary is not installed ---
+  if [ "$known" = 0 ]; then
     if [ -n "$vhosts" ]; then
+      printf '\n  %s[%s]%s %s\n' "$C_BOLD" "$pool_name" "$C_RESET" "$pool_file"
       warn "leftover pool: its PHP-FPM binary ($fpm_bin) is not installed, but vhosts point here: $vhosts"
       COUNT_DOWN_POOLS=$((COUNT_DOWN_POOLS+1)); raise_exit 1
     else
-      info "${C_DIM}leftover config: PHP-FPM binary $fpm_bin is not installed, nothing runs this pool (not a risk).${C_RESET}"
-      info "${C_DIM}To clean up: dpkg -l | awk '/^rc/ && \$2 ~ /php/ {print \$2}'  then  apt purge <packages>${C_RESET}"
+      ORPHAN_POOLS[$branch]=$(( ${ORPHAN_POOLS[$branch]:-0} + 1 ))   # collapsed below
     fi
     return 0
   fi
+
+  # Pending config: the running master loaded the pool before the file's last change
+  local pending=0
+  if [ "$running" = "running" ] && [ -n "${RUNNING_START[$key]:-}" ] \
+     && [ -n "$(changed_since "${RUNNING_START[$key]}" "$pool_file")" ]; then pending=1; fi
+
+  # --- collapse idle, patched pools (no vhost, nothing pending) into a per-version summary ---
+  if [ "$status" = fixed ] && [ -z "$vhosts" ] && [ "$pending" = 0 ]; then
+    if [ "$running" = running ]; then IDLE_RUNNING[$branch]=$(( ${IDLE_RUNNING[$branch]:-0} + 1 ))
+    else IDLE_STOPPED[$branch]=$(( ${IDLE_STOPPED[$branch]:-0} + 1 )); fi
+    return 0
+  fi
+
+  # --- full report (vulnerable, serving a vhost, pending reload or a down pool) ---
+  printf '\n  %s[%s]%s %s\n' "$C_BOLD" "$pool_name" "$C_RESET" "$pool_file"
   printf '          PHP %s %s | FPM: %s | listen: %s\n' "${version%%[-~+]*}" "$(status_label "$status")" "$running" "$listen"
-  # A pool nothing runs and nothing points to serves no requests: one line instead of advice
   if [ "$running" != "running" ] && [ -z "$vhosts" ]; then
     info "${C_DIM}not running and no vhost points here: serves no requests (apply the mitigations before starting this FPM).${C_RESET}"
-    return 0
   fi
   info "vhosts: ${vhosts:-(no vhost in the web server config points here)}"
 
-  if [ "$running" = "running" ] && [ -n "${RUNNING_START[$key]:-}" ]; then
-    if [ -n "$(changed_since "${RUNNING_START[$key]}" "$pool_file")" ]; then
-      warn "pool file changed after PHP-FPM started: the values below are NOT active until a reload"
-      COUNT_PENDING_CONFIG=$((COUNT_PENDING_CONFIG+1)); raise_exit 1
-    fi
+  if [ "$pending" = 1 ]; then
+    warn "pool file changed after PHP-FPM started: the values below are NOT active until a reload"
+    COUNT_PENDING_CONFIG=$((COUNT_PENDING_CONFIG+1)); raise_exit 1
   elif [ "$running" != "running" ] && [ -n "$vhosts" ]; then
     warn "vhosts point to this pool, but its PHP-FPM is not running (502 errors, or another FPM owns the socket?)"
     COUNT_DOWN_POOLS=$((COUNT_DOWN_POOLS+1)); raise_exit 1
   fi
 
-  local upload upload_src mem mem_src mem_locked=0 post
+  local upload upload_src mem mem_src mem_locked=0 post umax="" fatal=""
   if [ "$status" = pre54 ]; then upload="n/a"; upload_src="-"
   elif [ -n "${override[session.upload_progress.enabled]+x}" ]; then
     upload=${override[session.upload_progress.enabled]}; upload_src="pool ${override_kind[session.upload_progress.enabled]}"
@@ -1098,14 +1272,45 @@ report_pool() {
   else mem=$(ini_of_binary "$key" memory_limit); mem=${mem:-128M}; mem_src="php.ini"; fi
   if [ -n "${override[post_max_size]+x}" ]; then post=${override[post_max_size]}
   else post=$(ini_of_binary "$key" post_max_size); post=${post:-8M}; fi
+  if [ "$status" != fixed ] && [ "$status" != pre54 ]; then
+    if [ -n "${override[upload_max_filesize]+x}" ]; then umax=${override[upload_max_filesize]}
+    else umax=$(ini_of_binary "$key" upload_max_filesize); fi
+    if [ -n "${override[fatal_error_backtraces]+x}" ]; then fatal=${override[fatal_error_backtraces]}
+    else fatal=$(ini_of_binary "$key" fatal_error_backtraces); fi
+  fi
 
   # Remember whether user-level overrides (.user.ini) could undo the mitigations
   if [ "$status" != fixed ] && [ "$running" = "running" ]; then
     [ "${override_kind[session.upload_progress.enabled]:-}" != admin ] || [ "$mem_locked" != 1 ] && USER_OVERRIDE_RISK=1
   fi
 
-  evaluate_settings "$status" "$upload" "$upload_src" "$mem" "$mem_locked" "$mem_src" "$post" pool
+  evaluate_settings "$status" "$upload" "$upload_src" "$mem" "$mem_locked" "$mem_src" "$post" pool \
+                    "${version%%[-~+]*}" "$umax" "$fatal" "$panel"
   [ "$status" != fixed ] && [ "$running" = "running" ] && [ -n "$vhosts" ] && raise_exit 2
+}
+
+# Prints the collapsed section-4 summaries (idle / stopped / leftover pools per version)
+join_counts() {   # stdin: lines "branch count" -> "5.6(1) 7.0(1) ..."
+  sort -V | awk '{printf "%s(%s) ", $1, $2}'
+}
+print_pool_summaries() {
+  # Note: ${#assoc[@]} on an empty associative array errors under set -u, but iterating
+  # "${!assoc[@]}" is safe and yields nothing, so build each line that way and test the result.
+  local b line
+  line=$(for b in "${!IDLE_RUNNING[@]}"; do printf '%s %s\n' "$b" "${IDLE_RUNNING[$b]}"; done | join_counts)
+  if [ -n "${line// /}" ]; then
+    printf '\n'
+    info "FPM versions running only idle pools (no vhost in the web server config points to them): ${line% }"
+    advise "these FPM masters serve no site; after checking with 'nginx -T' / the Apache config, consider stopping and disabling them"
+    info "    (on ISPConfig, also turn the PHP version off in the panel). Informational: this does not change the exit code."
+  fi
+  line=$(for b in "${!IDLE_STOPPED[@]}"; do printf '%s %s\n' "$b" "${IDLE_STOPPED[$b]}"; done | join_counts)
+  [ -n "${line// /}" ] && info "${C_DIM}Installed FPM versions with only idle, stopped pools (no vhost): ${line% }${C_RESET}"
+  line=$(for b in "${!ORPHAN_POOLS[@]}"; do printf '%s %s\n' "$b" "${ORPHAN_POOLS[$b]}"; done | join_counts)
+  if [ -n "${line// /}" ]; then
+    info "${C_DIM}Leftover pool configs whose PHP-FPM is not installed (no vhost points here): ${line% }${C_RESET}"
+    info "${C_DIM}    Clean up: dpkg -l | awk '/^rc/ && \$2 ~ /php/ {print \$2}'  then  apt purge <packages>, and remove the stale pool files.${C_RESET}"
+  fi
 }
 
 USER_OVERRIDE_RISK=0
@@ -1134,6 +1339,7 @@ for pool_file in "${POOL_FILES[@]}"; do
   fi
 done
 [ "$pool_count" = 0 ] && info "No PHP-FPM pool configuration found."
+print_pool_summaries
 
 # Host ports published by running containers: host port -> container name
 declare -A CONTAINER_BY_HOSTPORT
@@ -1151,26 +1357,25 @@ fi
 for sock in "${!SOCKET_VHOSTS[@]}"; do
   [ -n "${SOCKET_MATCHED[$sock]+x}" ] && continue
   if [[ $sock =~ :([0-9]+)$ ]] && [ -n "${CONTAINER_BY_HOSTPORT[${BASH_REMATCH[1]}]:-}" ]; then
+    cname=${CONTAINER_BY_HOSTPORT[${BASH_REMATCH[1]}]}
+    SOCKET_STATUS[$sock]=${CONTAINER_STATUS[$cname]:-unverified}   # for section 8
     printf '\n'
     info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
-    info "${C_DIM}served by container ${CONTAINER_BY_HOSTPORT[${BASH_REMATCH[1]}]}: its PHP and ports are checked in section 6${C_RESET}"
+    info "${C_DIM}served by container $cname: its PHP and ports are checked in section 6${C_RESET}"
     continue
   fi
   if [[ $sock == *fcgiwrap* ]]; then
+    SOCKET_STATUS[$sock]=fixed   # a CGI wrapper, not PHP: not a vulnerable PHP backend
     printf '\n'
     info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
     if [ -S "$sock" ]; then
       info "${C_DIM}fcgiwrap is a CGI wrapper (usually Perl/shell CGI), not PHP-FPM: not part of this audit.${C_RESET}"
     else
-      info "${C_DIM}fcgiwrap (CGI wrapper, not PHP-FPM) socket does not exist: CGI on this site is not working.${C_RESET}"
+      info "${C_DIM}fcgiwrap (CGI wrapper, not PHP-FPM) socket does not exist: CGI on this site is not working (broken site, not un-audited PHP).${C_RESET}"
     fi
     continue
   fi
-  if [ "$COUNT_UNMATCHED" = 0 ]; then
-    printf '\n'; warn "FastCGI addresses used by vhosts but not matched to any pool file: their PHP was NOT audited"
-  fi
-  COUNT_UNMATCHED=$((COUNT_UNMATCHED+1))
-  info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
+  # Does anything actually listen on this socket?
   owner=""
   if command -v ss >/dev/null 2>&1; then
     if [[ $sock == /* ]]; then
@@ -1179,6 +1384,21 @@ for sock in "${!SOCKET_VHOSTS[@]}"; do
       owner=$(ss -ltnpH "sport = :${BASH_REMATCH[1]}" 2>/dev/null | awk '{print $NF; exit}')
     fi
   fi
+  # A unix socket that does not exist (and nothing listens) is a broken reference, not
+  # un-audited PHP: the site gets a 502/404 for PHP. Report it as a broken site, no warning.
+  if [ -z "$owner" ] && { { [[ $sock == /* ]] && [ ! -S "$sock" ]; } || [[ $sock != /* ]]; }; then
+    SOCKET_STATUS[$sock]=broken
+    printf '\n'
+    info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
+    info "${C_DIM}nothing listens here: this is a broken site (PHP returns 502/404), not un-audited PHP. Fix or remove the vhost's handler.${C_RESET}"
+    continue
+  fi
+  if [ "$COUNT_UNMATCHED" = 0 ]; then
+    printf '\n'; warn "FastCGI addresses used by vhosts but not matched to any pool file: their PHP was NOT audited"
+  fi
+  COUNT_UNMATCHED=$((COUNT_UNMATCHED+1))
+  SOCKET_STATUS[$sock]=unverified   # something listens but we could not audit it: treat as not-proven-safe
+  info "$sock  <-  ${SOCKET_VHOSTS[$sock]}"
   info "${C_DIM}listening process: ${owner:-none found (nothing listens, or another host/container)}${C_RESET}"
   case $owner in
     *docker-proxy*|*containerd*|*conmon*)
@@ -1224,7 +1444,15 @@ if [ "$MODPHP_LOADED" = 1 ]; then
       info "global (${INI_LIST[0]:-php.ini not found}):"
     fi
     [ "$status" = pre54 ] && upload="n/a"
-    evaluate_settings "$status" "$upload" "$upload_src" "$mem" "$mem_locked" "$mem_src" "$post" modphp
+    mp_umax=""; mp_fatal=""
+    if [ "$status" != fixed ] && [ "$status" != pre54 ]; then
+      mp_umax=$(ini_get upload_max_filesize ${INI_LIST[@]+"${INI_LIST[@]}"})
+      [ -n "${APACHE_ADMIN[upload_max_filesize]+x}" ] && mp_umax=${APACHE_ADMIN[upload_max_filesize]}
+      mp_fatal=$(ini_get fatal_error_backtraces ${INI_LIST[@]+"${INI_LIST[@]}"})
+      [ -n "${APACHE_ADMIN[fatal_error_backtraces]+x}" ] && mp_fatal=${APACHE_ADMIN[fatal_error_backtraces]}
+    fi
+    evaluate_settings "$status" "$upload" "$upload_src" "$mem" "$mem_locked" "$mem_src" "$post" modphp \
+                      "${BIN_VERSION[$key]%%[-~+]*}" "$mp_umax" "$mp_fatal" 0
   done
   if [ ${#MODPHP_VHOSTS[@]} -gt 0 ]; then
     apache_start=""
@@ -1279,8 +1507,14 @@ if [ ${#FCGID_ENTRIES[@]} -gt 0 ]; then
     mem=$(ini_get memory_limit ${INI_LIST[@]+"${INI_LIST[@]}"}); mem=${mem:-128M}
     post=$(ini_get post_max_size ${INI_LIST[@]+"${INI_LIST[@]}"}); post=${post:-8M}
     [ "$status" = pre54 ] && upload="n/a"
+    cgi_umax=""; cgi_fatal=""
+    if [ "$status" != fixed ] && [ "$status" != pre54 ]; then
+      cgi_umax=$(ini_get upload_max_filesize ${INI_LIST[@]+"${INI_LIST[@]}"})
+      cgi_fatal=$(ini_get fatal_error_backtraces ${INI_LIST[@]+"${INI_LIST[@]}"})
+    fi
     info "php.ini: ${INI_LIST[0]:-?}"
-    evaluate_settings "$status" "$upload" "php.ini" "$mem" 0 "php.ini" "$post" cgi
+    evaluate_settings "$status" "$upload" "php.ini" "$mem" 0 "php.ini" "$post" cgi \
+                      "${BIN_VERSION[$key]%%[-~+]*}" "$cgi_umax" "$cgi_fatal" 0
     if [ "$status" != fixed ]; then raise_exit 2; USER_OVERRIDE_RISK=1; fi
   done
 fi
@@ -1326,6 +1560,7 @@ else
       info "${C_DIM}no PHP inside${C_RESET}"
     else
       status=$(container_php_status "$version")
+      [ -z "${CONTAINER_STATUS[$cname]+x}" ] && CONTAINER_STATUS[$cname]=$status
       if [ "$status" = fixed ]; then
         ok "PHP $version inside: $(status_label fixed)"
       else
@@ -1425,6 +1660,7 @@ if pgrep -x 'apache2|httpd' >/dev/null 2>&1; then
     case $kind in
       GLOBAL)   apache_global=1; ok "server-level multipart block, applies to every vhost: $f1 (line $f2)" ;;
       SCOPED)   info "multipart block outside the vhosts, limited to $f3: $f1 (line $f2)" ;;
+      SCOPEDVH) info "${C_DIM}vhost $f3 has a multipart block, but only inside a <Location>/<Directory>: it does not cover the whole vhost ($f1, line $f2)${C_RESET}" ;;
       GLOBALRW) warn "mod_rewrite multipart rule outside the vhosts ($f1, line $f2): vhosts do NOT inherit it"
                 advise "Use an <If> block instead (see below), or put the rule into every vhost." ;;
       WRONG)    bad "$f1 (line $f2): matches %{CONTENT_TYPE}, which is the RESPONSE type: this blocks nothing"
@@ -1436,20 +1672,35 @@ if pgrep -x 'apache2|httpd' >/dev/null 2>&1; then
                  fi ;;
     esac
   done <<<"$APACHE_SCAN"
-  vh_total=0; vh_blocked=0; vh_redirect=0; vh_open=""
-  declare -A VH_TAGS=() VH_PUBLIC=()
+  # Is the loaded mod_php itself vulnerable? (then every mod_php vhost serves vulnerable PHP)
+  modphp_vuln=0
+  if [ "$MODPHP_LOADED" = 1 ]; then
+    for mk in "${!RUNNING_BIN[@]}"; do [[ $mk == *.so ]] && [ "${BIN_STATUS[$mk]:-vuln}" != fixed ] && modphp_vuln=1; done
+  fi
+  vh_total=0; vh_vuln=0; vh_blocked=0; vh_redirect=0; vh_open=""
+  declare -A VH_TAGS=() VH_PUBLIC=() VH_VULN=()
   VH_ORDER=()
   while IFS=$'\t' read -r kind vh_file vh_name vh_is_blocked vh_is_redirect vh_auth vh_ip vh_method vh_root; do
     [ "$kind" = VHOST ] || continue
     # does this vhost hand requests to PHP? (mod_php: every vhost; otherwise a FastCGI/proxy handler)
-    if [ "$MODPHP_LOADED" != 1 ] && ! apache_expand_includes "$vh_file" 2>/dev/null | grep -vE '^[[:space:]]*#' \
-         | grep -qiE 'proxy:(unix|fcgi)|fcgi://|FcgidWrapper|AddHandler[[:space:]].*php|SetHandler[[:space:]].*php'; then
+    vh_expanded=$(apache_expand_includes "$vh_file" 2>/dev/null)
+    has_fcgi=0; grep -qiE 'proxy:(unix|fcgi)|fcgi://|FcgidWrapper' <<<"$vh_expanded" && has_fcgi=1
+    has_modphp_handler=0; grep -qiE 'AddHandler[[:space:]].*php|SetHandler[[:space:]].*php' <<<"$vh_expanded" && has_modphp_handler=1
+    if [ "$MODPHP_LOADED" != 1 ] && [ "$has_fcgi" = 0 ] && [ "$has_modphp_handler" = 0 ]; then
       continue
     fi
     vh_total=$((vh_total+1))
+    # does THIS vhost forward to a vulnerable PHP? FastCGI/proxy -> backend status; else mod_php
+    vh_is_vuln=0
+    if [ "$has_fcgi" = 1 ]; then
+      apache_vhost_backend_vuln <<<"$vh_expanded" && vh_is_vuln=1
+    else
+      vh_is_vuln=$modphp_vuln
+    fi
+    [ "$vh_is_vuln" = 1 ] && { vh_vuln=$((vh_vuln+1)); VH_VULN[$vh_name]=1; }
     if [ "$vh_is_redirect" = 1 ]; then vh_redirect=$((vh_redirect+1)); continue
     elif [ "$vh_is_blocked" = 1 ] || [ "$apache_global" = 1 ]; then vh_blocked=$((vh_blocked+1))
-    else vh_open+="$vh_name"$'\n'; fi
+    elif [ "$vh_is_vuln" = 1 ]; then vh_open+="$vh_name"$'\n'; fi
     # access control in front of PHP (per name; a name is public if any of its blocks is)
     tags=""
     [ "$vh_auth" = 1 ] && tags+="password,"
@@ -1465,26 +1716,24 @@ if pgrep -x 'apache2|httpd' >/dev/null 2>&1; then
     if [ -n "$tags" ]; then VH_TAGS[$vh_name]+="$tags"; else VH_TAGS[$vh_name]+=""; VH_PUBLIC[$vh_name]=1; fi
   done <<<"$APACHE_SCAN"
   vh_open_count=$(grep -c . <<<"$vh_open")
-  info "<VirtualHost> blocks serving PHP: $vh_total | multipart blocked: $vh_blocked | redirect only: $vh_redirect | NOT blocked: $vh_open_count"
-  if [ "$vh_open_count" -gt 0 ]; then
-    if [ "$NEED_FILTER" = 1 ]; then
-      warn "vhosts serving vulnerable PHP without a multipart block:"
-      COUNT_NO_MULTIPART_BLOCK=$((COUNT_NO_MULTIPART_BLOCK+vh_open_count)); raise_exit 1
-    else
-      info "${C_DIM}vhosts without a multipart block (fine, PHP is patched):${C_RESET}"
-    fi
-    print_name_list <<<"$vh_open"
-    if [ "$NEED_FILTER" = 1 ]; then
-      advise "In every vhost that does not need uploads (or server-wide in a conf-enabled file):"
-      info "    <If \"req('Content-Type') =~ /multipart/i\">"
-      info "        Require all denied"
-      info "    </If>"
-    fi
+  info "<VirtualHost> blocks serving PHP: $vh_total | serving vulnerable PHP: $vh_vuln | multipart blocked: $vh_blocked | redirect only: $vh_redirect | NOT blocked: $vh_open_count"
+  if [ "$vh_vuln" = 0 ]; then
+    info "${C_DIM}every Apache vhost serving PHP forwards to a patched PHP: no multipart block needed.${C_RESET}"
   fi
-  # Access control in front of PHP: only meaningful while a vulnerable PHP serves requests
-  if [ "$NEED_FILTER" = 1 ] && [ ${#VH_ORDER[@]} -gt 0 ]; then
+  if [ "$vh_open_count" -gt 0 ]; then
+    warn "vhosts serving vulnerable PHP without a multipart block:"
+    COUNT_NO_MULTIPART_BLOCK=$((COUNT_NO_MULTIPART_BLOCK+vh_open_count)); raise_exit 1
+    print_name_list <<<"$vh_open"
+    advise "In every vhost that does not need uploads (or server-wide in a conf-enabled file):"
+    info "    <If \"req('Content-Type') =~ /multipart/i\">"
+    info "        Require all denied"
+    info "    </If>"
+  fi
+  # Access control in front of PHP: only the vhosts that actually serve vulnerable PHP
+  if [ "$vh_vuln" -gt 0 ] && [ ${#VH_ORDER[@]} -gt 0 ]; then
     protected_list=""; public_list=""
     for n in "${VH_ORDER[@]}"; do
+      [ -n "${VH_VULN[$n]+x}" ] || continue
       if [ -n "${VH_PUBLIC[$n]+x}" ]; then public_list+="$n"$'\n'
       else t=${VH_TAGS[$n]%,}; t=$(tr ',' '\n' <<<"$t" | sort -u | tr '\n' ',' ); protected_list+="$n[${t%,}]"$'\n'; fi
     done
@@ -1512,8 +1761,8 @@ if pgrep -x nginx >/dev/null 2>&1; then
   [ -n "${MP_VARS// /}" ] && info "${C_DIM}multipart map variable(s): $MP_VARS${C_RESET}"
   NGINX_VHOST_FILES=()
   for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do [ -f "$f" ] && NGINX_VHOST_FILES+=("$f"); done
-  sb_total=0; sb_blocked=0; sb_open=""
-  declare -A NG_TAGS=() NG_PUBLIC=()
+  sb_total=0; sb_vuln=0; sb_open=""
+  declare -A NG_TAGS=() NG_PUBLIC=() NG_VULN=()
   NG_ORDER=()
   while IFS=$'\t' read -r sb_file sb_line sb_text; do
     [ -n "$sb_file" ] || continue
@@ -1526,33 +1775,36 @@ if pgrep -x nginx >/dev/null 2>&1; then
     sb_total=$((sb_total+1))
     sb_name=$(grep -m1 -E '^[[:space:]]*server_name[[:space:]]' <<<"$sb_text" | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/[;[:space:]].*//')
     sb_name=${sb_name:-$(basename "$sb_file"):$sb_line}
-    if nginx_text_blocks_multipart "$sb_full" "$MP_VARS"; then sb_blocked=$((sb_blocked+1))
-    else sb_open+="$sb_name"$'\n'; fi
+    # Does THIS block forward to a vulnerable PHP? (a block to a patched pool needs no block)
+    bvuln=0; nginx_block_backend_vuln "$sb_full" && bvuln=1
+    [ "$bvuln" = 1 ] && sb_vuln=$((sb_vuln+1))
+    blocked=0; nginx_text_blocks_multipart "$sb_full" "$MP_VARS" && blocked=1
+    [ "$bvuln" = 1 ] && [ "$blocked" = 0 ] && sb_open+="$sb_name"$'\n'
     # access control in front of PHP (server level, "location /" or a PHP location)
     tags=""
     for t in $(nginx_block_access_flags "$sb_text"); do tags+="$t,"; done
     [ -n "${NG_TAGS[$sb_name]+x}" ] || NG_ORDER+=("$sb_name")
     if [ -n "$tags" ]; then NG_TAGS[$sb_name]+="$tags"; else NG_TAGS[$sb_name]+=""; NG_PUBLIC[$sb_name]=1; fi
+    [ "$bvuln" = 1 ] && NG_VULN[$sb_name]=1
   done < <(nginx_server_blocks ${NGINX_VHOST_FILES[@]+"${NGINX_VHOST_FILES[@]}"})
   sb_open_count=$(grep -c . <<<"$sb_open")
-  info "server blocks passing to PHP-FPM: $sb_total | multipart blocked: $sb_blocked | NOT blocked: $sb_open_count"
-  if [ "$sb_open_count" -gt 0 ]; then
-    if [ "$NEED_FILTER" = 1 ]; then
-      warn "server blocks without a multipart block (the PHP behind them may be patched; see section 4):"
-      COUNT_NO_MULTIPART_BLOCK=$((COUNT_NO_MULTIPART_BLOCK+sb_open_count)); raise_exit 1
-    else
-      info "${C_DIM}server blocks without a multipart block (fine, PHP is patched):${C_RESET}"
-    fi
-    print_name_list <<<"$sb_open"
-    if [ "$NEED_FILTER" = 1 ]; then
-      advise "In the http {} context:  map \$http_content_type \$php2shell_multipart { default 0; ~*multipart 1; }"
-      advise "In every server {} that does not need uploads:  if (\$php2shell_multipart) { return 403; }"
-      advise "(ISPConfig regenerates vhost files: put the if into /etc/nginx/fastcgi_params and fastcgi.conf, which every PHP location includes)"
-    fi
+  info "server blocks passing to PHP-FPM: $sb_total | serving vulnerable PHP: $sb_vuln | of those multipart-blocked: $((sb_vuln - sb_open_count)) | NOT blocked: $sb_open_count"
+  if [ "$sb_vuln" = 0 ]; then
+    info "${C_DIM}every nginx server block forwards to a patched PHP: no multipart block needed.${C_RESET}"
   fi
-  if [ "$NEED_FILTER" = 1 ] && [ ${#NG_ORDER[@]} -gt 0 ]; then
+  if [ "$sb_open_count" -gt 0 ]; then
+    warn "server blocks serving vulnerable PHP without a multipart block:"
+    COUNT_NO_MULTIPART_BLOCK=$((COUNT_NO_MULTIPART_BLOCK+sb_open_count)); raise_exit 1
+    print_name_list <<<"$sb_open"
+    advise "In the http {} context:  map \$http_content_type \$php2shell_multipart { default 0; ~*multipart 1; }"
+    advise "In every server {} that does not need uploads:  if (\$php2shell_multipart) { return 403; }"
+    advise "(ISPConfig regenerates vhost files: put the if into /etc/nginx/fastcgi_params and fastcgi.conf, which every PHP location includes)"
+  fi
+  # Access control: only the server blocks that actually serve vulnerable PHP are relevant
+  if [ "$sb_vuln" -gt 0 ] && [ ${#NG_ORDER[@]} -gt 0 ]; then
     protected_list=""; public_list=""
     for n in "${NG_ORDER[@]}"; do
+      [ -n "${NG_VULN[$n]+x}" ] || continue
       if [ -n "${NG_PUBLIC[$n]+x}" ]; then public_list+="$n"$'\n'
       else t=$(tr ',' '\n' <<<"${NG_TAGS[$n]%,}" | sort -u | tr '\n' ','); protected_list+="$n[${t%,}]"$'\n'; fi
     done
@@ -1572,6 +1824,27 @@ if pgrep -x nginx >/dev/null 2>&1; then
     info "nginx server_tokens is on (default): the Server header and error pages show the nginx version"
     advise "server_tokens off;   (http {} context)"
   fi
+fi
+
+# --- session.upload_progress on PATCHED PHP (CVE-2026-115560) ---
+# The 2026-10-23 fixed releases do NOT fix this one. Report it once per PHP version
+# (from the php.ini), not per pool: on an nginx host with many pools that would be ~140 lines.
+# Vulnerable PHP is already reported in section 4/5, so only patched versions are listed here.
+up_versions=""
+declare -A UP_SEEN=()
+for key in "${!RUNNING_BIN[@]}"; do
+  [ "${BIN_STATUS[$key]:-vuln}" = fixed ] || continue
+  v=$(ini_of_binary "$key" session.upload_progress.enabled); v=${v:-On}
+  is_on "$v" || continue
+  ver=${BIN_VERSION[$key]%%[-~+]*}
+  [ -n "${UP_SEEN[$ver]+x}" ] && continue; UP_SEEN[$ver]=1
+  up_versions+="$ver "
+  COUNT_UPLOAD_PROGRESS=$((COUNT_UPLOAD_PROGRESS+1))
+done
+if [ -n "$up_versions" ]; then
+  warn "session.upload_progress.enabled is On in the php.ini of patched PHP: ${up_versions% } ($CVE_UP: the fixed releases do NOT fix this path)"
+  advise "session.upload_progress.enabled = 0 in each listed php.ini (hardly any app uses it), or php_admin_flag[session.upload_progress.enabled] = off per pool"
+  raise_exit 1
 fi
 
 # --- expose_php of the PHP binaries serving requests ---
@@ -1723,16 +1996,27 @@ if [ ${#WEB_ROOTS[@]} -eq 0 ]; then
 else
   info "${C_DIM}searched: ${WEB_ROOTS[*]}${C_RESET}"
   PHP_NAME=( \( -iname '*.php' -o -iname '*.php[0-9]' -o -iname '*.pht' -o -iname '*.phtml' -o -iname '*.phar' \) )
+  # "new" = content (mtime) OR metadata (ctime) changed since --since. ctime catches chmod /
+  # chown / rename that a tamper step does without touching mtime.
   FIND_OUT=$($LONG_TIMEOUT find "${WEB_ROOTS[@]}" -xdev -maxdepth 12 -type f \
-      \( \( "${PHP_NAME[@]}" -o -name .user.ini -o -name .htaccess \) -newermt "@$SINCE_EPOCH" -printf 'NEW\t%TY-%Tm-%Td %TH:%TM\t%u\t%p\n' \) , \
+      \( \( "${PHP_NAME[@]}" -o -name .user.ini -o -name .htaccess \) \( -newermt "@$SINCE_EPOCH" -o -newerct "@$SINCE_EPOCH" \) -printf 'NEW\t%TY-%Tm-%Td %TH:%TM\t%u\t%p\n' \) , \
       \( -path '*/uploads/*' "${PHP_NAME[@]}" -printf 'UPL\t%TY-%Tm-%Td %TH:%TM\t%u\t%p\n' \) , \
       \( \( -name .user.ini -o -name .htaccess \) -size -1024k -printf 'CFG\t-\t-\t%p\n' \) 2>/dev/null)
   find_rc=$?
-  [ "$find_rc" = 124 ] && warn "The file search timed out (300 s): the lists below are incomplete."
+  if [ "$find_rc" = 124 ]; then
+    warn "INCOMPLETE: the web-root file search hit the 300 s timeout; the lists below are partial."
+    COUNT_INCOMPLETE=$((COUNT_INCOMPLETE+1)); raise_exit 1
+  fi
   new_list=$(awk -F'\t' '$1 == "NEW"' <<<"$FIND_OUT" | sort -t$'\t' -k2,2r)
   upl_list=$(awk -F'\t' '$1 == "UPL"' <<<"$FIND_OUT")
-  # webshell patterns in new PHP files and in PHP files under uploads/
-  shell_hits=$( { cut -f4 <<<"$new_list"; cut -f4 <<<"$upl_list"; } | grep -iE '\.(php[0-9]?|pht|phtml|phar)$' | sort -u | head -n 5000 \
+  # webshell patterns in new PHP files and in PHP files under uploads/ (capped at 5000 files)
+  shell_candidates=$( { cut -f4 <<<"$new_list"; cut -f4 <<<"$upl_list"; } | grep -iE '\.(php[0-9]?|pht|phtml|phar)$' | sort -u)
+  shell_total=$(grep -c . <<<"$shell_candidates")
+  if [ "$shell_total" -gt 5000 ]; then
+    warn "INCOMPLETE: $shell_total candidate files exceed the 5000-file webshell-scan cap; only the first 5000 were scanned."
+    COUNT_INCOMPLETE=$((COUNT_INCOMPLETE+1)); raise_exit 1
+  fi
+  shell_hits=$(head -n 5000 <<<"$shell_candidates" \
                | while IFS= read -r p; do [ -f "$p" ] && grep -qiE "$WEBSHELL_RE" "$p" 2>/dev/null && echo "$p"; done)
   if [ -n "$shell_hits" ]; then
     bad "Webshell-like code in new PHP files or in uploads/ (eval/assert/system on request data):"
@@ -1743,8 +2027,22 @@ else
   fi
   new_count=$(grep -c . <<<"$new_list")
   if [ "$new_count" -gt 0 ]; then
-    check "$new_count PHP / .htaccess / .user.ini file(s) created or modified since $SINCE_HUMAN (newest first):"
-    awk -F'\t' '{print $2 "  " $3 "  " $4}' <<<"$new_list" | show_limited 30 info
+    check "$new_count PHP / .htaccess / .user.ini file(s) created or modified since $SINCE_HUMAN, grouped by directory (newest first):"
+    # Group by plugin/theme (or the first level under wp-content), else by the immediate directory,
+    # so a bulk plugin update collapses to one line; a directory with one file is shown as that file.
+    awk -F'\t' '
+      function groupkey(p,   d) {
+        if (match(p, /\/wp-content\/(plugins|themes|mu-plugins)\/[^\/]+\//)) return substr(p, 1, RSTART + RLENGTH - 2)
+        if (match(p, /\/wp-content\/[^\/]+\//)) return substr(p, 1, RSTART + RLENGTH - 2)
+        d = p; sub(/\/[^\/]*$/, "", d); return d
+      }
+      { k = groupkey($4); n[k]++; if ($2 > newest[k]) newest[k] = $2; owner[k] = $3; sample[k] = $4 }
+      END {
+        for (k in n) {
+          if (n[k] == 1) printf "%s  %s  %s\n", newest[k], owner[k], sample[k]
+          else printf "%s  %s  %s/  (%d files)\n", newest[k], owner[k], k, n[k]
+        }
+      }' <<<"$new_list" | sort -r | show_limited 30 info
   else
     ok "No PHP / .htaccess / .user.ini file created or modified since $SINCE_HUMAN."
   fi
@@ -1773,6 +2071,37 @@ else
   if [ -n "$cfg_hits" ]; then
     check ".htaccess / .user.ini with auto_prepend_file or a PHP handler (legitimate e.g. for Wordfence or a PHP version switch):"
     cut -c1-170 <<<"$cfg_hits" | show_limited 25 info
+  fi
+fi
+
+# --- 9b2. PHP files in temp directories (/tmp, /var/tmp, /dev/shm) ---
+printf '\n  %sPHP files in temp directories (/tmp, /var/tmp, /dev/shm)%s\n' "$C_BOLD" "$C_RESET"
+TMP_DIRS=()
+for d in /tmp /var/tmp /dev/shm; do [ -d "$d" ] && TMP_DIRS+=("$d"); done
+if [ ${#TMP_DIRS[@]} -eq 0 ]; then
+  info "none of /tmp, /var/tmp, /dev/shm exist."
+else
+  tmp_out=$($LONG_TIMEOUT find "${TMP_DIRS[@]}" -xdev -maxdepth 6 -type f \
+      \( -iname '*.php' -o -iname '*.php[0-9]' -o -iname '*.pht' -o -iname '*.phtml' -o -iname '*.phar' \) \
+      -printf '%TY-%Tm-%Td %TH:%TM\t%u\t%p\n' 2>/dev/null)
+  tmp_rc=$?
+  if [ "$tmp_rc" = 124 ]; then
+    warn "INCOMPLETE: the temp-directory search hit the 300 s timeout; the list below is partial."
+    COUNT_INCOMPLETE=$((COUNT_INCOMPLETE+1)); raise_exit 1
+  fi
+  if [ -n "$tmp_out" ]; then
+    # a webshell dropped in a world-writable temp dir is a classic staging spot
+    tmp_shell=$(cut -f3 <<<"$tmp_out" | sort -u | head -n 5000 \
+                | while IFS= read -r p; do [ -f "$p" ] && grep -qiE "$WEBSHELL_RE" "$p" 2>/dev/null && echo "$p"; done)
+    if [ -n "$tmp_shell" ]; then
+      bad "Webshell-like PHP in a temp directory (eval/assert/system on request data):"
+      show_limited 25 info <<<"$tmp_shell"
+      COUNT_IOC=$((COUNT_IOC+$(grep -c . <<<"$tmp_shell"))); raise_exit 2
+    fi
+    check "PHP file(s) in a temp directory (a temp dir should not hold PHP; review each):"
+    sort -r <<<"$tmp_out" | awk -F'\t' '{print $1 "  " $2 "  " $3}' | show_limited 25 info
+  else
+    ok "No PHP file in /tmp, /var/tmp or /dev/shm."
   fi
 fi
 
@@ -1820,12 +2149,24 @@ persist_hits=""
 while IFS= read -r f; do
   m=$(stat -c %Y "$f" 2>/dev/null || echo 0)
   [ "$m" -ge "$SINCE_EPOCH" ] || continue
-  # a package file changed by an upgrade and still matching the package is not interesting
-  if [ "$HAVE_DPKG" = 1 ]; then
+  # Annotate each hit with its source, so a package change / a mask link is easy to tell
+  # apart from a file that belongs to no package (the more interesting case).
+  ann=""
+  if [ -L "$f" ] && [ "$(readlink "$f" 2>/dev/null)" = /dev/null ]; then
+    ann="masked unit (symlink to /dev/null)"
+  elif [ "$HAVE_DPKG" = 1 ]; then
     pkg=$(dpkg -S "$f" 2>/dev/null | grep -v '^diversion' | head -n1 | cut -d: -f1)
-    if [ -n "$pkg" ] && ! dpkg --verify "$pkg" 2>/dev/null | grep -qF " $f"; then continue; fi
+    if [ -n "$pkg" ]; then
+      # a package file changed by an upgrade and still matching the package is not interesting
+      dpkg --verify "$pkg" 2>/dev/null | grep -qF " $f" || continue
+      ann="modified file of package $pkg"
+    else
+      ann="not owned by any package"
+    fi
+  else
+    ann="package ownership not checked (no dpkg)"
   fi
-  persist_hits+="$(date -d "@$m" '+%Y-%m-%d %H:%M')  $f"$'\n'
+  persist_hits+="$(date -d "@$m" '+%Y-%m-%d %H:%M')  $f    [$ann]"$'\n'
 done < <(persist_files | sort -u)
 if [ -n "${persist_hits//$'\n'/}" ]; then
   check "Changed since $SINCE_HUMAN (cron, systemd units, SSH keys, accounts, sudo, shell startup files):"
@@ -1887,28 +2228,85 @@ else
   info "ss is not installed: skipped."
 fi
 
+# --- 9g. Integrity of the installed PHP packages (dpkg --verify) ---
+printf '\n  %sIntegrity of the installed PHP packages (dpkg --verify)%s\n' "$C_BOLD" "$C_RESET"
+if [ "$HAVE_DPKG" = 1 ]; then
+  php_pkgs=$(dpkg-query -W -f='${Package}\n' 'php*' 'libapache2-mod-php*' 2>/dev/null | sort -u)
+  if [ -n "$php_pkgs" ]; then
+    # dpkg --verify lists files whose size/mode/checksum no longer match the package. Config
+    # files under /etc are expected to differ (admin edits); a changed binary/extension is not.
+    # shellcheck disable=SC2086  # intentional split of the package name list
+    verify_raw=$($LONG_TIMEOUT dpkg --verify $php_pkgs 2>/dev/null); verify_rc=$?
+    verify_out=$(awk '$NF !~ /^\/etc\// && $1 ~ /5/ {print}' <<<"$verify_raw")
+    if [ "$verify_rc" = 124 ]; then
+      warn "INCOMPLETE: dpkg --verify of the PHP packages hit the 300 s timeout."
+      COUNT_INCOMPLETE=$((COUNT_INCOMPLETE+1)); raise_exit 1
+    fi
+    if [ -n "$verify_out" ]; then
+      check "PHP package files no longer match the package (a changed PHP binary or extension is suspicious; review each):"
+      cut -c1-170 <<<"$verify_out" | show_limited 25 info
+    else
+      ok "Every installed PHP binary/extension still matches its package (config files under /etc excluded)."
+    fi
+  else
+    info "No PHP package installed from dpkg."
+  fi
+else
+  info "dpkg is not available: skipped."
+fi
+
 # =============================================================================
 header "10. Summary"
-if [ "$EXIT_CODE" = 0 ]; then
-  ok "Every PHP serving requests is patched, no restart or reload is pending. Nothing to do."
-  [ "$COUNT_REVIEW" -gt 0 ] && info "[CHECK] items to review by hand in section 9: $COUNT_REVIEW"
+# Three parts: is PHP patched, are the mitigations in place, and what the compromise search found
+# (including whether it was able to run to completion).
+
+printf '  %s1) Patch status%s\n' "$C_BOLD" "$C_RESET"
+if [ $((COUNT_VULN_RUNNING + COUNT_CONTAINER_VULN + COUNT_NEEDS_RESTART + COUNT_STALE_OTHER + COUNT_PENDING_CONFIG + COUNT_DOWN_POOLS + ${COUNT_UNMATCHED:-0} + COUNT_VULN_INSTALLED)) -eq 0 ]; then
+  ok "Every PHP serving requests is patched; no vulnerable PHP is installed."
 else
-  [ "$COUNT_IOC" -gt 0 ]            && bad  "Strong signs of compromise (section 9): $COUNT_IOC"
   [ "$COUNT_VULN_RUNNING" -gt 0 ]   && bad  "Vulnerable or unverifiable RUNNING PHP processes: $COUNT_VULN_RUNNING"
-  [ "$COUNT_EXPOSED_FASTCGI" -gt 0 ] && bad "Container FastCGI ports published on all interfaces: $COUNT_EXPOSED_FASTCGI"
-  [ "$COUNT_CONTAINER_VULN" -gt 0 ]  && bad "Running containers with vulnerable or unknown PHP: $COUNT_CONTAINER_VULN"
-  [ "$COUNT_EXPOSED_DB" -gt 0 ]      && warn "Container database/cache ports published on all interfaces: $COUNT_EXPOSED_DB"
+  [ "$COUNT_CONTAINER_VULN" -gt 0 ] && bad  "Running containers with vulnerable or unknown PHP: $COUNT_CONTAINER_VULN"
   [ "$COUNT_NEEDS_RESTART" -gt 0 ]  && bad  "Patched package, but restart pending: $COUNT_NEEDS_RESTART"
   [ "$COUNT_STALE_OTHER" -gt 0 ]    && warn "Other processes still running a replaced PHP binary: $COUNT_STALE_OTHER"
   [ "$COUNT_PENDING_CONFIG" -gt 0 ] && warn "Config changes waiting for a reload: $COUNT_PENDING_CONFIG"
   [ "$COUNT_DOWN_POOLS" -gt 0 ]     && warn "Pools used by vhosts whose PHP-FPM is not running: $COUNT_DOWN_POOLS"
   [ "${COUNT_UNMATCHED:-0}" -gt 0 ] && warn "FastCGI addresses whose PHP could not be audited: $COUNT_UNMATCHED"
   [ "$COUNT_VULN_INSTALLED" -gt 0 ] && warn "Vulnerable or unverifiable installed PHP binaries/modules in total: $COUNT_VULN_INSTALLED"
+fi
+
+printf '\n  %s2) Mitigations and hardening%s\n' "$C_BOLD" "$C_RESET"
+if [ $((COUNT_EXPOSED_FASTCGI + COUNT_EXPOSED_DB + COUNT_NO_MULTIPART_BLOCK + COUNT_WRONG_BLOCK + COUNT_RLIMIT + COUNT_UPLOAD_PROGRESS + COUNT_WEBSERVER_FAILED)) -eq 0 ]; then
+  ok "No pending mitigation or hardening action from this run."
+else
+  [ "$COUNT_EXPOSED_FASTCGI" -gt 0 ] && bad  "Container FastCGI ports published on all interfaces: $COUNT_EXPOSED_FASTCGI"
+  [ "$COUNT_EXPOSED_DB" -gt 0 ]      && warn "Container database/cache ports published on all interfaces: $COUNT_EXPOSED_DB"
   [ "$COUNT_NO_MULTIPART_BLOCK" -gt 0 ] && warn "vhosts / server blocks serving vulnerable PHP without a multipart block: $COUNT_NO_MULTIPART_BLOCK"
   [ "$COUNT_WRONG_BLOCK" -gt 0 ]    && warn "Multipart blocks that do not work (%{CONTENT_TYPE}): $COUNT_WRONG_BLOCK"
   [ "$COUNT_RLIMIT" -gt 0 ]         && warn "RLIMIT_AS / RLIMIT_DATA memory limits on vulnerable PHP: $COUNT_RLIMIT"
-  [ "$COUNT_REVIEW" -gt 0 ]         && info "[CHECK] items to review by hand in section 9: $COUNT_REVIEW"
+  [ "$COUNT_UPLOAD_PROGRESS" -gt 0 ] && warn "Patched PHP versions with session.upload_progress still On ($CVE_UP): $COUNT_UPLOAD_PROGRESS"
+  [ "$COUNT_WEBSERVER_FAILED" -gt 0 ] && warn "Web server services in the 'failed' state: $COUNT_WEBSERVER_FAILED"
+fi
 
+printf '\n  %s3) Compromise and investigation%s\n' "$C_BOLD" "$C_RESET"
+if [ "$COUNT_IOC" -gt 0 ]; then bad "Strong signs of compromise (section 9): $COUNT_IOC"
+else ok "No strong sign of compromise found (section 9)."; fi
+[ "$COUNT_REVIEW" -gt 0 ] && info "[CHECK] items to review by hand in section 9: $COUNT_REVIEW"
+if [ "$COUNT_INCOMPLETE" -gt 0 ]; then
+  warn "The compromise search was INCOMPLETE in $COUNT_INCOMPLETE place(s) (a timeout or the 5000-file cap): a clean result there is not conclusive."
+else
+  info "${C_DIM}The compromise search ran to completion. A clean result still cannot prove the server is clean: some exploit paths leave no trace.${C_RESET}"
+fi
+
+printf '\n'
+if [ "$EXIT_CODE" = 0 ]; then
+  if [ "$COUNT_REVIEW" -gt 0 ]; then
+    ok "Nothing to patch, restart or reload. $COUNT_REVIEW [CHECK] item(s) in section 9 still need a look by hand."
+  else
+    ok "Nothing to do."
+  fi
+fi
+
+if [ "$EXIT_CODE" != 0 ]; then
   # Only the actions that belong to the problems found in this run
   printf '\n  %sRecommended actions:%s\n' "$C_BOLD" "$C_RESET"
   step=0
@@ -1929,7 +2327,9 @@ else
   fi
   if [ "$COUNT_VULN_RUNNING" -gt 0 ]; then
     action "Update PHP: 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12; for old branches (5.6-8.1) a backported" \
-           "package (Debian/Ubuntu: packages.sury.org). Package-only upgrade (Debian/Ubuntu):" \
+           "package (Debian/Ubuntu: packages.sury.org). On an EOL distribution (e.g. Debian 9) sury has NO" \
+           "backport: a higher build in the apt cache is not a fix (see section 2), so isolate / migrate instead." \
+           "Package-only upgrade where a fix exists (Debian/Ubuntu):" \
            "apt-get install --only-upgrade \$(dpkg-query -W -f='\${db:Status-Abbrev}\${Package}\\n' 'php*' 'libapache2-mod-php*' | awk '/^ii/{print substr(\$0,4)}' | grep -E '^(php[0-9]|libapache2-mod-php[0-9])')" \
            "Then RESTART PHP-FPM (not reload), or Apache when using mod_php, and re-run this script."
     action "Until the update is done: apply the temporary settings shown above per pool / handler" \
@@ -1949,6 +2349,14 @@ else
   if [ "$COUNT_RLIMIT" -gt 0 ]; then
     action "Remove the RLIMIT_AS / RLIMIT_DATA limits (RLimitMEM, LimitAS=, LimitDATA=, ulimit -v / -d) listed in" \
            "section 8; limit memory with a cgroup instead: systemctl set-property <service> MemoryLimit=<size>."
+  fi
+  if [ "$COUNT_UPLOAD_PROGRESS" -gt 0 ]; then
+    action "Turn session.upload_progress.enabled off on the patched PHP versions listed in section 8 ($CVE_UP)," \
+           "in each php.ini (or php_admin_flag[session.upload_progress.enabled] = off per pool), then reload."
+  fi
+  if [ "$COUNT_WEBSERVER_FAILED" -gt 0 ]; then
+    action "Start the web server service(s) reported as 'failed' in section 3 and fix why they fail to start," \
+           "then re-run this audit: the clean sections above do not cover a server that is set up to run but is down."
   fi
   if [ "$COUNT_NEEDS_RESTART" -gt 0 ]; then
     action "Restart the PHP services marked 'restart required' in section 3, e.g.:" \
