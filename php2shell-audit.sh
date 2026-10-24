@@ -1248,8 +1248,11 @@ report_pool() {
   # --- full report (vulnerable, serving a vhost, pending reload or a down pool) ---
   printf '\n  %s[%s]%s %s\n' "$C_BOLD" "$pool_name" "$C_RESET" "$pool_file"
   printf '          PHP %s %s | FPM: %s | listen: %s\n' "${version%%[-~+]*}" "$(status_label "$status")" "$running" "$listen"
+  # A pool nothing runs and nothing points to serves no requests: one line, and skip the
+  # per-setting FAIL/WARN (it would contradict "serves no requests" and read as an active problem).
   if [ "$running" != "running" ] && [ -z "$vhosts" ]; then
     info "${C_DIM}not running and no vhost points here: serves no requests (apply the mitigations before starting this FPM).${C_RESET}"
+    return 0
   fi
   info "vhosts: ${vhosts:-(no vhost in the web server config points here)}"
 
@@ -1999,7 +2002,7 @@ else
   # "new" = content (mtime) OR metadata (ctime) changed since --since. ctime catches chmod /
   # chown / rename that a tamper step does without touching mtime.
   FIND_OUT=$($LONG_TIMEOUT find "${WEB_ROOTS[@]}" -xdev -maxdepth 12 -type f \
-      \( \( "${PHP_NAME[@]}" -o -name .user.ini -o -name .htaccess \) \( -newermt "@$SINCE_EPOCH" -o -newerct "@$SINCE_EPOCH" \) -printf 'NEW\t%TY-%Tm-%Td %TH:%TM\t%u\t%p\n' \) , \
+      \( \( "${PHP_NAME[@]}" -o -name .user.ini -o -name .htaccess \) \( -newermt "@$SINCE_EPOCH" -o -newerct "@$SINCE_EPOCH" \) -printf 'NEW\t%TY-%Tm-%Td %TH:%TM\t%u\t%p\t%T@\t%C@\n' \) , \
       \( -path '*/uploads/*' "${PHP_NAME[@]}" -printf 'UPL\t%TY-%Tm-%Td %TH:%TM\t%u\t%p\n' \) , \
       \( \( -name .user.ini -o -name .htaccess \) -size -1024k -printf 'CFG\t-\t-\t%p\n' \) 2>/dev/null)
   find_rc=$?
@@ -2027,20 +2030,25 @@ else
   fi
   new_count=$(grep -c . <<<"$new_list")
   if [ "$new_count" -gt 0 ]; then
-    check "$new_count PHP / .htaccess / .user.ini file(s) created or modified since $SINCE_HUMAN, grouped by directory (newest first):"
+    check "$new_count PHP / .htaccess / .user.ini file(s) changed since $SINCE_HUMAN (content or metadata/ctime), grouped by directory (date = content mtime):"
     # Group by plugin/theme (or the first level under wp-content), else by the immediate directory,
     # so a bulk plugin update collapses to one line; a directory with one file is shown as that file.
-    awk -F'\t' '
+    # Fields: $2 mtime (display), $3 owner, $4 path, $5 mtime epoch, $6 ctime epoch.
+    # A group whose files ALL have mtime < since is a metadata-only (ctime) change: the content is
+    # unchanged, only permissions/ownership/rename touched the inode (e.g. an ISPConfig stats refresh).
+    awk -F'\t' -v since="$SINCE_EPOCH" '
       function groupkey(p,   d) {
         if (match(p, /\/wp-content\/(plugins|themes|mu-plugins)\/[^\/]+\//)) return substr(p, 1, RSTART + RLENGTH - 2)
         if (match(p, /\/wp-content\/[^\/]+\//)) return substr(p, 1, RSTART + RLENGTH - 2)
         d = p; sub(/\/[^\/]*$/, "", d); return d
       }
-      { k = groupkey($4); n[k]++; if ($2 > newest[k]) newest[k] = $2; owner[k] = $3; sample[k] = $4 }
+      { k = groupkey($4); n[k]++; if ($2 > newest[k]) newest[k] = $2; owner[k] = $3; sample[k] = $4
+        if ($5 + 0 >= since) content[k] = 1 }
       END {
         for (k in n) {
-          if (n[k] == 1) printf "%s  %s  %s\n", newest[k], owner[k], sample[k]
-          else printf "%s  %s  %s/  (%d files)\n", newest[k], owner[k], k, n[k]
+          tag = content[k] ? "" : "   [metadata only (ctime); content unchanged]"
+          if (n[k] == 1) printf "%s  %s  %s%s\n", newest[k], owner[k], sample[k], tag
+          else printf "%s  %s  %s/  (%d files)%s\n", newest[k], owner[k], k, n[k], tag
         }
       }' <<<"$new_list" | sort -r | show_limited 30 info
   else
